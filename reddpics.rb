@@ -4,69 +4,131 @@ require "fileutils"
 require "uri"
 require "http"
 require "redd"
+require "nokogiri"
 require "trollop"
+
+# shitty logger
+class Logger
+  @indent = 0
+
+  def self.putindent
+    $stderr << ("  " * Logger.indent)
+  end
+
+  def self.putprefix
+    $stderr << "-- "
+  end
+
+  def self.putline(str)
+    putindent
+    putprefix
+    $stderr.puts(str)
+  end
+
+  def self.put(str)
+    putindent
+    putprefix
+    $stderr << str
+  end
+
+  def self.write(str)
+    $stderr << str
+  end
+
+  class << self
+    attr_accessor :indent
+  end
+end
 
 module Util
   def self.download(url, headers: {}, maxredirs: 5)
-    $stderr << "-- wget #{url.dump} ... "
+    Logger.put "** wget(#{url.dump}) ... "
     begin
       response = HTTP.headers(headers).get(url)
       location = response["Location"]
       if response.code >= 400 then
-        $stderr << "failed: HTTP status #{response.code} #{response.reason}\n"
+        Logger.write "failed: HTTP status #{response.code} #{response.reason}\n"
         return nil
       elsif location then
         if location.match(/^https?:/) then
           if not location.match(/imgur.com\/removed/) then
             if maxredirs == 0 then
-              $stderr << "failed: too many redirects\n"
+              Logger.write "failed: too many redirects\n"
               return nil
             end
-            $stderr << "redirects to #{location.dump}\n"
+            $stderr << "ok: redirects to #{location.dump}\n"
             return download(location, headers: headers, maxredirs: maxredirs - 1)
           else
-            $stderr << "image has been removed (imgur hackery)\n"
+            Logger.write "failed: image has been removed (imgur hackery)\n"
             return nil
           end
         else
-          $stderr << "failed: redirects to a bad url (location: #{location.dump})\n"
+          Logger.write "failed: redirects to a bad url (location: #{location.dump})\n"
           return nil
         end
       end
-      $stderr << "done!\n"
+      Logger.write "ok\n"
       return response
     rescue => err
-      $stderr << "failed: (#{err.class}) #{err.message}\n"
+      Logger.write "failed: (#{err.class}) #{err.message}\n"
       return nil
     end
+  end
+
+  def self.imgurdl(url)
+    parts = URI.parse(url)
+    result = {id: nil, title: "", images: []}
+    title = nil
+    if not parts.host.match(/^(i\.imgur|imgur|www\.imgur)\.com$/) then
+      raise ArgumentError, "url #{url.dump} does not look like an imgur url"
+    elsif (not parts.path) || (parts.path == "/") then
+      raise ArgumentError, "can't download the entire frontpage. sorry :<"
+    end
+    if parts.path.match(/^\/(a|gallery|user\/.+?\/favorites\/.+?)\//) then
+      result[:id] = parts.path.split("/")[-1]
+      source = "http://imgur.com/ajaxalbums/getimages/#{result[:id]}/hit.json"
+      response = Util::download(source)
+      if not response then
+        raise ArgumentError, "could not download json information (#{source.dump})"
+      end
+      json = JSON.load(response.to_s)
+      if (json["success"] == true) || (json["data"] == []) then
+        json["data"]["images"].each do |imgchunk|
+          finalurl = "http://i.imgur.com/#{imgchunk["hash"]}#{imgchunk["ext"]}"
+          result[:images] << {url: finalurl, title: imgchunk["title"], description: imgchunk["description"]}
+        end
+      else
+        if json["success"] != false then
+          raise ArgumentError, "json was successfully downloaded and parsed, but key 'success' is false?"
+        else
+          raise ArgumentError, "key 'data' is just an empty array; probably not an album ..."
+        end
+      end
+    else
+      result[:id] = parts.path.split("/").first
+      response = Util::download(url)
+      if response then
+        document = Nokogiri::HTML(response.to_s)
+        result[:title] = document.css(".post-title").first.content
+        document.css(".post-image-container>div>img").each do |node|
+          srcattrib = node.attributes["src"]
+          if srcattrib then
+            url = srcattrib.value
+            if url.start_with?("//") then
+              url = "http:" + url
+            end
+            result[:images] << {url: url, title: "", description: ""}
+          end
+        end
+      else
+        raise ArgumentError, "could not download page"
+      end
+    end
+    return result
   end
 end
 
 class ReddPics
-  def fix_url(url)
-    parts = URI.parse(url)
-    # don't modify imgur.com/a/<id> urls
-    if (parts.host == "imgur.com") && (not parts.path.match(/\/(a)\//)) then
-      parts.host = "i.imgur.com"
-      parts.path += ".jpg"
-      return parts.to_s
-    elsif parts.path.match(/\.gifv$/) then
-      parts.path = parts.path.gsub(/\.gifv$/, ".gif")
-      return parts.to_s
-    end
-    return url
-  end
-
-  def guess_is_image(url)
-    parts = URI.parse(url)
-    if parts.host.match(/^(i.imgur.com|imgur.com|i.reddituploads.com)$/) then
-      return true
-    elsif parts.path.match(/\.(jpe?g|gif|png)$/i) then
-      return true
-    end
-    return false
-  end
-
   def response_is_image(response)
     contenttype = response.mime_type
     if contenttype == nil then
@@ -124,17 +186,18 @@ class ReddPics
     end
   end
 
-  def handle_url(url, origurl)
-    $stderr.puts "++ checking #{url.dump} ..."
+  def handle_url(url, subfolder=nil)
+    Logger.putline "checking #{url.dump} ..."
     response = Util::download(url, headers: {referer: "https://www.reddit.com/r/#{@subreddit}"})
     if response then
       begin
-        filename = get_filename(origurl, response)
         if response_is_image(response) then
-          FileUtils.mkdir_p(@destfolder)
-          Dir.chdir(@destfolder) do
+          dlfolder = (subfolder ? File.join(@destfolder, subfolder) : @destfolder)
+          filename = get_filename(url, response)
+          FileUtils.mkdir_p(dlfolder)
+          Dir.chdir(dlfolder) do
             if not File.file?(filename) then
-              $stderr.puts "-- writing image to file #{filename.dump} ..."
+              Logger.putline "writing image to file #{filename.dump} ..."
               File.open(filename, "w") do |fh|
                 while true
                   data = response.readpartial
@@ -143,32 +206,62 @@ class ReddPics
                 end
               end
             else
-              $stderr.puts "-- already downloaded"
+              Logger.putline "already downloaded"
             end
           end
         else
-          $stderr.puts "-- skipping: 'Content-Type' does not report as an image!"
+          # this part is shit, because we repeating logic here. bad, awful, rewrite, etc.
+          parts = URI.parse(url)
+          if parts.host.match(/(www\.)?imgur.com/) then
+            Logger.putline "looks like an imgur page; will try to parse it"
+            Logger.indent += 1
+            begin
+              links = Util::imgurdl(url)
+              size = links[:images].size
+              if size > 0 then
+                if size == 1 then
+                  Logger.putline "downloading from single-image page ..."
+                  return handle_url(links[:images].first[:url])
+                else # album or somesuch
+                  albumfolder = "album_#{links[:id]}"
+                  Logger.putline "downloading album to subdirectory #{albumfolder.dump} ..."
+                  Logger.indent += 1
+                  links[:images].each do |img|
+                    handle_url(img[:url], albumfolder)
+                  end
+                  Logger.putline "*** album download done ***"
+                  Logger.indent -= 1
+                end
+              else
+                Logger.putline "page does not contain any images :("
+              end
+            rescue => err
+              Logger.putline "couldn't parse imgur url :("
+            end
+            Logger.indent -= 1
+          else
+            Logger.putline "skipping: 'Content-Type' does not report as an image!"
+          end
         end
       rescue => err
-        $stderr.puts "-- error: #{err.message}"
+        Logger.putline "error: #{err.message}"
       end
     else
-      $stderr.puts "-- skipping: downloading failed!"
+      Logger.putline "skipping: downloading failed!"
     end
-    $stderr.puts
+    # end of handle_url
   end
 
   def walk_subreddit(after=nil)
     links = get_listing(after)
     $stderr.puts "++ received #{links.size} links ..."
     links.each do |chunk|
-      origurl = chunk[:url]
-      url = fix_url(origurl)
+      url = chunk[:url]
       title = chunk[:title]
       permalink = chunk[:permalink]
       isself = chunk[:is_self]
       if not isself then
-        handle_url(url, origurl)
+        handle_url(url)
       end
     end
     if @pagecounter == 0 then
