@@ -18,7 +18,8 @@ Since reddpics uses httprb, redd, and trollop, you need to install them before y
 
 After that, usage is as simple as it gets:
 
-    # download all hot images from /r/aww
+    # download the first 100 hot images from /r/aww to ./images/aww
+    ./reddpics.rb aww --outputdir=./images/aww --limit=100 --maxpages=1 --section=hot
 
 All supported options:
 

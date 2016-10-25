@@ -115,6 +115,8 @@ class ReddPics
     section = @opts[:section]
     listingopts = {t: @opts[:time], limit: @opts[:limit], after: after}
     case section
+      when "hot" then
+        return @client.get_hot(@subreddit, listingopts)
       when "top" then
         return @client.get_top(@subreddit, listingopts)
       else
