@@ -12,7 +12,10 @@ class Logger
   @indent = 0
 
   def self.putindent
-    $stderr << ("  " * Logger.indent)
+    if @indent < 0 then
+      @indent = 0
+    end
+    $stderr << ("  " * @indent)
   end
 
   def self.putprefix
@@ -42,7 +45,7 @@ end
 
 module Util
   def self.download(url, headers: {}, maxredirs: 5)
-    Logger.put "** wget(#{url.dump}) ... "
+    Logger.put "wget(#{url.dump}) ... "
     begin
       response = HTTP.headers(headers).get(url)
       location = response["Location"]
@@ -75,16 +78,19 @@ module Util
     end
   end
 
+  # disgusting hack incoming
   def self.imgurdl(url)
     parts = URI.parse(url)
     result = {id: nil, title: "", images: []}
     title = nil
-    if not parts.host.match(/^(i\.imgur|imgur|www\.imgur)\.com$/) then
+    if not parts.host.match(/^((i|m)\.imgur|imgur|www\.imgur)\.com$/) then
       raise ArgumentError, "url #{url.dump} does not look like an imgur url"
     elsif (not parts.path) || (parts.path == "/") then
       raise ArgumentError, "can't download the entire frontpage. sorry :<"
     end
-    if parts.path.match(/^\/(a|gallery|user\/.+?\/favorites\/.+?)\//) then
+    # user favorites are almost guaranteed to fail.
+    # don't be mad at me, be mad at imgur for their shitty API
+    if parts.path.match("^/a/") then
       result[:id] = parts.path.split("/")[-1]
       source = "http://imgur.com/ajaxalbums/getimages/#{result[:id]}/hit.json"
       response = Util::download(source)
@@ -92,13 +98,13 @@ module Util
         raise ArgumentError, "could not download json information (#{source.dump})"
       end
       json = JSON.load(response.to_s)
-      if (json["success"] == true) || (json["data"] == []) then
+      if (json["success"] == true) && (json["data"] != []) then
         json["data"]["images"].each do |imgchunk|
           finalurl = "http://i.imgur.com/#{imgchunk["hash"]}#{imgchunk["ext"]}"
           result[:images] << {url: finalurl, title: imgchunk["title"], description: imgchunk["description"]}
         end
       else
-        if json["success"] != false then
+        if json["success"] != true then
           raise ArgumentError, "json was successfully downloaded and parsed, but key 'success' is false?"
         else
           raise ArgumentError, "key 'data' is just an empty array; probably not an album ..."
@@ -109,15 +115,19 @@ module Util
       response = Util::download(url)
       if response then
         document = Nokogiri::HTML(response.to_s)
-        result[:title] = document.css(".post-title").first.content
-        document.css(".post-image-container>div>img").each do |node|
-          srcattrib = node.attributes["src"]
-          if srcattrib then
-            url = srcattrib.value
-            if url.start_with?("//") then
-              url = "http:" + url
+        #result[:title] = document.css(".post-title").first
+        document.css(".post-image-container>div").each do |node|
+          # need to do sub-selection, because some images are wrapped in <a> for zooming
+          img = node.css("img").first
+          if img && img.attributes && img.attributes["src"] then
+            srcattrib = img.attributes["src"]
+            if srcattrib then
+              url = srcattrib.value
+              if url.start_with?("//") then
+                url = "http:" + url
+              end
+              result[:images] << {url: url, title: "", description: ""}
             end
-            result[:images] << {url: url, title: "", description: ""}
           end
         end
       else
@@ -205,6 +215,7 @@ class ReddPics
                   fh << data
                 end
               end
+              @dlcount += 1
             else
               Logger.putline "already downloaded"
             end
@@ -221,7 +232,8 @@ class ReddPics
               if size > 0 then
                 if size == 1 then
                   Logger.putline "downloading from single-image page ..."
-                  return handle_url(links[:images].first[:url])
+                  handle_url(links[:images].first[:url])
+                  Logger.indent -= 1
                 else # album or somesuch
                   albumfolder = "album_#{links[:id]}"
                   Logger.putline "downloading album to subdirectory #{albumfolder.dump} ..."
@@ -236,7 +248,12 @@ class ReddPics
                 Logger.putline "page does not contain any images :("
               end
             rescue => err
-              Logger.putline "couldn't parse imgur url :("
+              Logger.putline "couldn't parse imgur url: (#{err.class}) #{err.message}"
+              if err.is_a?(TypeError) then
+                err.backtrace.each do |line|
+                  Logger.putline line
+                end
+              end
             end
             Logger.indent -= 1
           else
@@ -265,7 +282,7 @@ class ReddPics
       end
     end
     if @pagecounter == 0 then
-      $stderr.puts "=== done! ==="
+      $stderr.puts "=== done downloading images from /r/#{@subreddit}!"
     else
       $stderr.puts "** ############################# ..."
       $stderr.puts "** ##### opening next page ##### ..."
@@ -283,24 +300,32 @@ class ReddPics
     @destfolder = @opts[:outputdir]
     @section = @opts[:section]
     @pagecounter = @opts[:maxpages]
-    walk_subreddit
+    @dlcount = 0
+    begin
+      walk_subreddit
+    ensure
+      $stderr.puts "=== statistics:"
+      $stderr.puts "=== downloaded #{@dlcount} images"
+    end
   end
 end
 
 opts = Trollop::options do
   banner (
-    "Usage: #$0 <subreddit> [<options>]\n" +
+    "Usage: #{File.basename $0} <subreddit ...> [<options>]\n" +
     "Valid options:"
   )
-  opt(:outputdir, "Output directory to download images to. default is './r_<subredditname>'",
+  opt(:outputdir,
+      "Output directory to download images to. default is './r_<subredditname>'.\n" + 
+      "You can use '%s' as template (for example, when downloading from several subreddits)",
     type: String)
   opt(:maxpages,  "Maximum pages to fetch (note: values over 10 may not work!)",
     type: Integer, default: 10)
-  opt(:limit,     "How many links to fetch per page. Maximum value is 100 (default is 100)",
+  opt(:limit,     "How many links to fetch per page. Maximum value is 100",
     type: Integer, default: 100)
-  opt(:section,   "What to download. options are 'hot', 'top', and 'controversial'. default is 'top'",
+  opt(:section,   "What to download. options are 'hot', 'top', and 'controversial'.",
     type: String, default: "top")
-  opt(:time,      "From which timespan to download. options are day, week, month, year, and all. default is all",
+  opt(:time,      "From which timespan to download. options are day, week, month, year, and all.",
     type: String, default: "all")
   opt(:username,  "Your reddit username - overrides 'REDDPICS_USERNAME'",
     type: String)
@@ -313,8 +338,6 @@ opts = Trollop::options do
 end
 
 if ARGV.size > 0 then
-  subreddit = ARGV.first
-  opts[:outputdir] = if opts[:outputdir] then opts[:outputdir] else "./r_#{subreddit}" end
   authinfo =
   {
     appid:    opts[:appid]    || ENV["REDDPICS_APPID"],
@@ -329,10 +352,21 @@ if ARGV.size > 0 then
     user_agent: "ImageDownloader (ver1.0)"
   )
   client.authorize!
-  ReddPics.new(client, subreddit, opts)
+  ARGV.each do |subreddit|
+    instanceopts = opts.dup
+    if opts[:outputdir] then
+      if opts[:outputdir].match(/%s/) then
+        instanceopts[:outputdir] = sprintf(opts[:outputdir], subreddit)
+      end
+    else
+      instanceopts[:outputdir] = "./r_#{subreddit}"
+    end
+    #require "pp"; pp [subreddit, instanceopts]
+    ReddPics.new(client, subreddit, instanceopts)
+  end
 else
-  puts "usage: #$0 <subreddit> [ -o <destination-folder> [... <other options>]]"
-  puts "try #$0 --help for other options"
+  puts "usage: #{File.basename $0} <subreddit> [ -o <destination-folder> [... <other options>]]"
+  puts "try #{File.basename $0} --help for other options"
 end
 
 

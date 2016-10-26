@@ -12,9 +12,9 @@ Include this file in your `~/.bashrc` (or whichever shell you use), type `exec b
 
 ----
 
-Since reddpics uses httprb, redd, and trollop, you need to install them before you can use it:  
+Since reddpics uses httprb, redd, nokogiri, and trollop, you need to install them before you can use it:  
 
-    gem install http redd trollop
+    gem install http redd trollop nokogiri
 
 After that, usage is as simple as it gets:
 
