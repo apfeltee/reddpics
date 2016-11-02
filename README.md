@@ -8,20 +8,23 @@ Once you have those, create `~/.config/reddpics-login.sh`, with the following co
     export REDDPICS_USERNAME="<your-reddit-username>"
     export REDDPICS_PASSWORD="<your-reddit-password>"
 
-Include this file in your `~/.bashrc` (or whichever shell you use), type `exec bash`, and you're pretty much good to go.
+Include this file in your `~/.bashrc` (or whichever shell you use), type `exec bash`, and you're pretty much good to go.  
+If you're still not sure what to do, try 'reddpics --apihelp'.
 
 ----
 
 # Features
 
-As of now, reddpics supports `http://i.reddit.com` images, `http://i.imgur.com` images, as well as imgur albums, imgur gallery pages, and single-image imgur pages. Any URL that sets the proper content-type header (which would be `image/(png|gif|jpeg)`) is downloaded as image.  
-
+  - Any URL whose Content-Type is that of an image (image/(jpeg|png|gif)), or webm (video/webm)
+  - imgur pages (fairly complete)
+  - gfycat links (fairly complete)
+  - more to come, eventually
 
 # Installation and Usage
 
-Since reddpics uses httprb, redd, nokogiri, and trollop, you need to install them before you can use it:  
+Since reddpics uses some gems, you need to install them before you can use it:  
 
-    gem install http redd trollop nokogiri
+    gem install http redd trollop nokogiri colorize
 
 After that, usage is as simple as it gets:
 
@@ -30,12 +33,16 @@ After that, usage is as simple as it gets:
 
 All supported options:
 
-    -o, --outputdir=<s>    Output directory to download images to. default is './r_<subredditname>'
+    -o, --outputdir=<s>    Output directory to download images to. default is './r_<subredditname>'.
+                           You can use '%s' as template (for example, when downloading from several subreddits)
     -m, --maxpages=<i>     Maximum pages to fetch (note: values over 10 may not work!) (default: 10)
-    -l, --limit=<i>        How many links to fetch per page. Maximum value is 100 (default is 100) (default: 100)
-    -s, --section=<s>      What to download. options are 'hot', 'top', and 'controversial'. default is 'top' (default: top)
-    -t, --time=<s>         From which timespan to download. options are day, week, month, year, and all. default is all (default: all)
+    -f, --filesize=<i>     Maximum filesize for images (default: 5000000)
+    -l, --limit=<i>        How many links to fetch per page. Maximum value is 100 (default: 100)
+    -s, --section=<s>      What to download. options are 'new', 'hot', 'top', and 'controversial'. (Default: top)
+    -t, --time=<s>         From which timespan to download. options are 'day', 'week', 'month', 'year', and 'all'. (Default: all)
     -u, --username=<s>     Your reddit username - overrides 'REDDPICS_USERNAME'
     -p, --password=<s>     Your reddit password - overrides 'REDDPICS_PASSWORD'
     -a, --apikey=<s>       Your API key - overrides 'REDDPICS_APIKEY'
     -i, --appid=<s>        Your API appid - overrides 'REDDPICS_APPID'
+    -#, --apihelp          Prints a quick'n'dirty explanation how to get your API credentials
+    -h, --help             Show this message

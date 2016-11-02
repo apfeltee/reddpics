@@ -479,6 +479,7 @@ elsif ARGV.size > 0 then
     else
       instanceopts[:outputdir] = "./r_#{subreddit}"
     end
+    String.disable_colorization(true) if not $stderr.tty?
     ReddPics.new(client, subreddit, instanceopts)
   end
 else
