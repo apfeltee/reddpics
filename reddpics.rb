@@ -6,6 +6,11 @@ require "http"
 require "redd"
 require "nokogiri"
 require "trollop"
+require "colorize"
+
+# exceptions
+class NoAdapterError < StandardError
+end
 
 # shitty logger
 class Logger
@@ -44,76 +49,41 @@ class Logger
 end
 
 module Util
-  def self.download(url, headers: {}, maxredirs: 5)
-    Logger.put "wget(#{url.dump}) ... "
-    begin
-      response = HTTP.headers(headers).get(url)
-      location = response["Location"]
-      if response.code >= 400 then
-        Logger.write "failed: HTTP status #{response.code} #{response.reason}\n"
-        return nil
-      elsif location then
-        if location.match(/^https?:/) then
-          if not location.match(/imgur.com\/removed/) then
-            if maxredirs == 0 then
-              Logger.write "failed: too many redirects\n"
-              return nil
-            end
-            $stderr << "ok: redirects to #{location.dump}\n"
-            return download(location, headers: headers, maxredirs: maxredirs - 1)
-          else
-            Logger.write "failed: image has been removed (imgur hackery)\n"
-            return nil
+  module Pages
+    # disgusting hack incoming
+    def self.imgurdl(url, response)
+      parts = URI.parse(url)
+      result = {name: nil, title: "", images: []}
+      title = nil
+      if not parts.host.match(/^((i|m)\.imgur|imgur|www\.imgur)\.com$/) then
+        raise ArgumentError, "url #{url.dump} does not look like an imgur url"
+      elsif (not parts.path) || (parts.path == "/") then
+        raise ArgumentError, "can't download the entire frontpage. sorry :<"
+      end
+      # user favorites are almost guaranteed to fail.
+      # don't be mad at me, be mad at imgur for their shitty API
+      if parts.path.match("^/a/") then
+        result[:name] = parts.path.split("/")[-1]
+        source = "http://imgur.com/ajaxalbums/getimages/#{result[:name]}/hit.json"
+        response = Util::download(source)
+        if not response then
+          raise ArgumentError, "could not download json information (#{source.dump})"
+        end
+        json = JSON.load(response.to_s)
+        if (json["success"] == true) && (json["data"] != []) then
+          json["data"]["images"].each do |imgchunk|
+            finalurl = "http://i.imgur.com/#{imgchunk["hash"]}#{imgchunk["ext"]}"
+            result[:images] << {url: finalurl, title: imgchunk["title"], description: imgchunk["description"]}
           end
         else
-          Logger.write "failed: redirects to a bad url (location: #{location.dump})\n"
-          return nil
-        end
-      end
-      Logger.write "ok\n"
-      return response
-    rescue => err
-      Logger.write "failed: (#{err.class}) #{err.message}\n"
-      return nil
-    end
-  end
-
-  # disgusting hack incoming
-  def self.imgurdl(url)
-    parts = URI.parse(url)
-    result = {id: nil, title: "", images: []}
-    title = nil
-    if not parts.host.match(/^((i|m)\.imgur|imgur|www\.imgur)\.com$/) then
-      raise ArgumentError, "url #{url.dump} does not look like an imgur url"
-    elsif (not parts.path) || (parts.path == "/") then
-      raise ArgumentError, "can't download the entire frontpage. sorry :<"
-    end
-    # user favorites are almost guaranteed to fail.
-    # don't be mad at me, be mad at imgur for their shitty API
-    if parts.path.match("^/a/") then
-      result[:id] = parts.path.split("/")[-1]
-      source = "http://imgur.com/ajaxalbums/getimages/#{result[:id]}/hit.json"
-      response = Util::download(source)
-      if not response then
-        raise ArgumentError, "could not download json information (#{source.dump})"
-      end
-      json = JSON.load(response.to_s)
-      if (json["success"] == true) && (json["data"] != []) then
-        json["data"]["images"].each do |imgchunk|
-          finalurl = "http://i.imgur.com/#{imgchunk["hash"]}#{imgchunk["ext"]}"
-          result[:images] << {url: finalurl, title: imgchunk["title"], description: imgchunk["description"]}
+          if json["success"] != true then
+            raise ArgumentError, "json was successfully downloaded and parsed, but key 'success' is false?"
+          else
+            raise ArgumentError, "key 'data' is just an empty array; probably not an album ..."
+          end
         end
       else
-        if json["success"] != true then
-          raise ArgumentError, "json was successfully downloaded and parsed, but key 'success' is false?"
-        else
-          raise ArgumentError, "key 'data' is just an empty array; probably not an album ..."
-        end
-      end
-    else
-      result[:id] = parts.path.split("/").first
-      response = Util::download(url)
-      if response then
+        result[:name] = parts.path.split("/")[-1]
         document = Nokogiri::HTML(response.to_s)
         #result[:title] = document.css(".post-title").first
         document.css(".post-image-container>div").each do |node|
@@ -130,11 +100,53 @@ module Util
             end
           end
         end
-      else
-        raise ArgumentError, "could not download page"
       end
+      return result
     end
-    return result
+  end
+
+  def self.download(url, headers: {}, maxredirs: 5)
+    Logger.put "wget(#{url.dump}) ... "
+    begin
+      response = HTTP.headers(headers).get(url)
+      location = response["Location"]
+      if response.code >= 400 then
+        Logger.write "failed: HTTP status #{response.code} #{response.reason}\n".red
+        return nil
+      elsif location then
+        if location.match(/^https?:/) then
+          # this literally shouldn't have to be here, but because imgur is dumb, we have to.
+          if not location.match(/imgur.com\/removed/) then
+            if maxredirs == 0 then
+              Logger.write "failed: too many redirects!\n".red
+              return nil
+            end
+            $stderr << "ok: redirects to #{location.dump}\n".green
+            return download(location, headers: headers, maxredirs: maxredirs - 1)
+          else
+            Logger.write "failed: image has been removed (imgur hackery)\n".red
+            return nil
+          end
+        else
+          Logger.write "failed: redirects to a bad url (location: #{location.dump})\n".red
+          return nil
+        end
+      end
+      Logger.write "ok\n".green
+      return response
+    rescue => err
+      Logger.write "failed: (#{err.class}) #{err.message}\n".red
+      return nil
+    end
+  end
+
+  def self.tryparse(url, response)
+    parts = URI.parse(url)
+    if parts.host.match(/(www\.)?imgur.com/) then
+      return Pages::imgurdl(url, response)
+    else
+      raise NoAdapterError, "no adapter for #{parts.host.to_s.dump}"
+    end
   end
 end
 
@@ -166,21 +178,27 @@ class ReddPics
     end
   end
 
-  def get_filename(url, response)
+  def get_filename(url, response, index=nil)
     parts = URI.parse(url)
-    path = parts.path[1 .. -1].gsub("/", "-").gsub("\\", "-")
+    # get rid of leading slash
+    realpath = parts.path[1 .. -1]
+    # just get the last part (the basename, duh)
+    path = File.basename(realpath)
+    # improvise if that didn't work for some reason
+    path = if path.length == 0 then realpath.gsub("/", "-").gsub("\\", "-") else path end
+    # get rid of the leading dot produced by File.extname
     ext = File.extname(path)[1 .. -1]
+    # now get the, uh, *actual* file extension ...
     actual = contenttype_to_ext(response)
-    if ext && ext.match(/(jpe?g|gif|png)$/i) then
-      if actual && (actual != ext) then
-        return File.basename(path, ext) + actual
-      end
-      return path
-    end
+    realext = (((ext == nil) || (ext.size == 0)) ? actual : ext)
+    # let's not fuck around, if the content-type isn't some type of image, it's b0rked
     if not actual then
       raise ArgumentError, "url #{url.dump} has a funky path, and did not set a 'Content-Type' header!!!"
     end
-    return path + "." + actual
+    # construct the new and improved filename
+    basename = File.basename(path, realext).gsub(/\.$/, "")
+    prefix = ((index != nil) ? "#{index}-" : "")
+    return "#{prefix}#{basename}.#{realext}"
   end
 
   def get_listing(after)
@@ -196,18 +214,18 @@ class ReddPics
     end
   end
 
-  def handle_url(url, subfolder=nil)
-    Logger.putline "checking #{url.dump} ..."
+  def handle_url(url, subfolder=nil, fileindex=nil)
+    #Logger.putline "checking #{url.dump} ..."
     response = Util::download(url, headers: {referer: "https://www.reddit.com/r/#{@subreddit}"})
     if response then
       begin
         if response_is_image(response) then
           dlfolder = (subfolder ? File.join(@destfolder, subfolder) : @destfolder)
-          filename = get_filename(url, response)
+          filename = get_filename(url, response, fileindex)
           FileUtils.mkdir_p(dlfolder)
           Dir.chdir(dlfolder) do
             if not File.file?(filename) then
-              Logger.putline "writing image to file #{filename.dump} ..."
+              Logger.putline "writing image to file #{filename.dump} ...".green
               File.open(filename, "w") do |fh|
                 while true
                   data = response.readpartial
@@ -217,54 +235,36 @@ class ReddPics
               end
               @dlcount += 1
             else
-              Logger.putline "already downloaded"
+              Logger.putline "already downloaded".yellow
             end
           end
         else
-          # this part is shit, because we repeating logic here. bad, awful, rewrite, etc.
-          parts = URI.parse(url)
-          if parts.host.match(/(www\.)?imgur.com/) then
-            Logger.putline "looks like an imgur page; will try to parse it"
-            Logger.indent += 1
-            begin
-              links = Util::imgurdl(url)
-              size = links[:images].size
-              if size > 0 then
-                if size == 1 then
-                  Logger.putline "downloading from single-image page ..."
-                  handle_url(links[:images].first[:url])
-                  Logger.indent -= 1
-                else # album or somesuch
-                  albumfolder = "album_#{links[:id]}"
-                  Logger.putline "downloading album to subdirectory #{albumfolder.dump} ..."
-                  Logger.indent += 1
-                  links[:images].each do |img|
-                    handle_url(img[:url], albumfolder)
-                  end
-                  Logger.putline "*** album download done ***"
-                  Logger.indent -= 1
-                end
-              else
-                Logger.putline "page does not contain any images :("
+          begin
+            links = Util::tryparse(url, response)
+            name = links[:links]
+            if links[:images].size == 0 then
+              Logger.putline "didn't find any images!".yellow
+            elsif links[:images].size == 1 then
+              Logger.putline "downloading single image ...".green
+              handle_url(links[:images].first[:url])
+            else
+              albumfolder = "album_#{links[:name]}"
+              Logger.putline "downloading album to subdirectory #{albumfolder.dump} ...".green
+              Logger.indent += 1
+              links[:images].each_with_index do |img, idx|
+                handle_url(img[:url], albumfolder, idx)
               end
-            rescue => err
-              Logger.putline "couldn't parse imgur url: (#{err.class}) #{err.message}"
-              if err.is_a?(TypeError) then
-                err.backtrace.each do |line|
-                  Logger.putline line
-                end
-              end
+              Logger.indent -= 1
             end
-            Logger.indent -= 1
-          else
-            Logger.putline "skipping: 'Content-Type' does not report as an image!"
+          rescue => err
+            Logger.putline "couldn't process page: (#{err.class}) #{err.message}".red
           end
         end
       rescue => err
-        Logger.putline "error: #{err.message}"
+        Logger.putline "error: #{err.message}".red
       end
     else
-      Logger.putline "skipping: downloading failed!"
+      Logger.putline "skipping: downloading failed!".red
     end
     # end of handle_url
   end
@@ -361,7 +361,6 @@ if ARGV.size > 0 then
     else
       instanceopts[:outputdir] = "./r_#{subreddit}"
     end
-    #require "pp"; pp [subreddit, instanceopts]
     ReddPics.new(client, subreddit, instanceopts)
   end
 else

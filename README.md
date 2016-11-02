@@ -12,6 +12,13 @@ Include this file in your `~/.bashrc` (or whichever shell you use), type `exec b
 
 ----
 
+# Features
+
+As of now, reddpics supports `http://i.reddit.com` images, `http://i.imgur.com` images, as well as imgur albums, imgur gallery pages, and single-image imgur pages. Any URL that sets the proper content-type header (which would be `image/(png|gif|jpeg)`) is downloaded as image.  
+
+
+# Installation and Usage
+
 Since reddpics uses httprb, redd, nokogiri, and trollop, you need to install them before you can use it:  
 
     gem install http redd trollop nokogiri
