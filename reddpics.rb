@@ -3,6 +3,7 @@
 require "fileutils"
 require "uri"
 require "uri/http"
+require "pp"
 require "http"
 require "redd"
 require "nokogiri"
@@ -58,80 +59,70 @@ end
 # shitty logger
 class Logger
   @indent = 0
+  @otherfile = nil
 
   def self.putindent
     if @indent < 0 then
       @indent = 0
     end
-    $stderr << ("  " * @indent)
+    write("  " * @indent)
   end
 
   def self.putprefix
-    $stderr << "-- "
+    write("-- ")
   end
 
-  def self.putline(str=nil)
+  def self.putline(str=nil, color: nil)
     putindent
     putprefix
-    $stderr.puts(str)
+    if not str.nil? then
+      write(str, color: color)
+    end
+    write("\n")
   end
 
   def self.put(str)
     putindent
     putprefix
-    $stderr << str
+    write(str)
   end
 
-  def self.write(str)
-    $stderr << str
+  def self.write(str, color: nil)
+    if color then
+      $stderr << str.colorize(color)
+    else
+      $stderr << str
+    end
+    if (not @otherfile.nil?) && (not @otherfile.closed?) then
+      @otherfile << str
+    end
   end
 
   class << self
-    attr_accessor :indent
+    attr_accessor :indent, :otherfile
   end
 end
 
 module Util
   def self.download(url, headers: {}, maxredirs: 5)
-    Logger.put "wget(#{url.dump}) ... "
+    # maybe add {"accept-encoding" => "identity"}?
+    Logger.put("wget(#{url.dump}) ... ")
     begin
-      response = HTTP.headers(headers).get(url)
-      location = response["Location"]
+      #headers["accept-encoding"] = "identity"
+      response = HTTP.headers(headers).follow(true).get(url)
       if response.code >= 400 then
-        Logger.write "failed: HTTP status #{response.code} #{response.reason}\n".red
+        Logger.write("failed: HTTP status #{response.code} #{response.reason}\n", color: :red)
         return nil
-      elsif location then
-        if location.match(/^https?:/) then
-          # this literally shouldn't have to be here, but because imgur is dumb, we have to.
-          if not location.match(/imgur.com\/removed/) then
-            if maxredirs == 0 then
-              Logger.write "failed: too many redirects!\n".red
-              return nil
-            end
-            $stderr << "redirect: #{location.dump}\n".yellow
-            return download(location, headers: headers, maxredirs: maxredirs - 1)
-          else
-            Logger.write "failed: image has been removed (imgur hackery)\n".red
-            return nil
-          end
-        else
-          parts = URI.parse(url)
-          relativedest = location
-          if relativedest[0] == "/" then
-            parts.path = relativedest
-          else
-            # the "directory" name being joined as a "file". abusing standard yey
-            dirname = File.dirname(parts.path)
-            parts.path = File.join(dirname, relativedest)
-          end
-          Logger.write "reconstructed relative redirect #{relativedest.dump} to #{parts.to_s.dump}\n".yellow
-          return download(parts.to_s, headers: headers, maxredirs: maxredirs - 1)
+      else
+        if response.uri.path.match("/removed.png") then
+          Logger.write("failed: image has been removed (imgur hackery)\n", color: :red)
+          return nil
         end
       end
-      Logger.write "ok\n".green
+      Logger.write("ok\n", color: :green)
       return response
     rescue => err
-      Logger.write "failed: (#{err.class}) #{err.message}\n".red
+      Logger.write("failed: (#{err.class}) #{err.message}\n", color: :red)
       return nil
     end
   end
@@ -145,11 +136,31 @@ module Util
     end
     return uri.to_s
   end
+
+  def self.sanitize_filename(filename, max_length: 128)
+    # get rid of any junk space
+    filename.strip!
+    # get rid of dots
+    filename.gsub!(/\./, '')
+    # get only the filename, not the whole path
+    filename.gsub!(/^.*(\\|\/)/, '')
+    # replace non-ascii characters
+    filename.gsub!(/[^0-9A-Za-z.\-]/, '_')
+    # get rid of double underscores
+    filename.gsub!(/__/, '_')
+    # get rid of underscore at beginning of string
+    filename.gsub!(/^_/, '')
+    # get rid of underscore at end of string
+    filename.gsub!(/_$/, '')
+    # finally, strip down to $max_length
+    return filename[0 .. max_length]
+  end
 end
 
 module Adapters
   # disgusting hack incoming
   def self.imgurdl(url, response)
+    Logger.putline("scanning imgur page ...", color: :cyan)
     parts = URI.parse(url)
     result = {name: nil, title: "", images: []}
     title = nil
@@ -222,14 +233,39 @@ module Adapters
     end
   end
 
+  def self.flickrdl(url, response)
+    jsonurl = Util::build_uri({
+      scheme: "https",
+      host: "noembed.com",
+      path: "/embed",
+      query: "url=#{url}"
+    })
+    jsonresponse = Util::download(jsonurl.to_s)
+    if jsonrsesponse then
+      jsondata = JSON.parse(jsonresponse.to_s)
+      if (mediaurl = jsondata["media_url"]) != nil then
+        return {name: nil, images: [{url: mediaurl, title: jsondata["title"], description: nil}]}
+      else
+        raise ArgumentError, "noembed json response didn't contain 'media_url'"
+      end
+    else
+      raise ArgumentError, "noembed.com call failed"
+    end
+  end
+
   # attempt to avoid redirects (in an extremely primitive way)
   def self.fixurl(url)
-    parts = URI.parse(url)
+    parts = URI.parse(url.scrub)
     if parts.host.match(/^(www\.)?gfycat.com/) then
       parts.scheme = "https"
       if parts.host == "www.gfycat.com" then
         parts.host = "gfycat.com"
       end
+      return parts.to_s
+    elsif parts.host == "i.reddituploads.com" then
+      return CGI.unescapeHTML(url)
+    elsif (parts.host == "i.imgur.com") && parts.path.end_with?(".gifv") then
+      parts.path.gsub!(/\.gifv/, ".gif")
       return parts.to_s
     end
     return url
@@ -241,6 +277,8 @@ module Adapters
       return Adapters::imgurdl(url, response)
     elsif parts.host.match(/^(www\.)?gfycat.com/) then
       return Adapters::gfycatdl(url, response)
+    elsif (parts.host == "flickr.com") || (parts.host == "www.flickr.com") || (parts.host == "flic.kr") then
+      return Adapters.flickrdl(url, response)
     else
       raise NoAdapterError, "no adapter for #{parts.host.to_s.dump}"
     end
@@ -280,116 +318,189 @@ class ReddPics
     end
   end
 
-  def get_filename(url, response, index=nil)
-    parts = URI.parse(url)
-    # get rid of leading slash
-    realpath = parts.path[1 .. -1]
-    # just get the last part (the basename, duh)
-    path = File.basename(realpath)
-    # improvise if that didn't work for some reason
-    path = if path.length == 0 then realpath.gsub("/", "-").gsub("\\", "-") else path end
-    # get rid of the leading dot produced by File.extname
-    ext = File.extname(path)[1 .. -1]
-    # now get the, uh, *actual* file extension ...
-    actual = contenttype_to_ext(response)
-    realext = (((ext == nil) || (ext.size == 0)) ? actual : ext)
-    # let's not fuck around, if the content-type isn't some type of image, it's b0rked
-    if not actual then
-      raise ArgumentError, "url #{url.dump} has a funky path, and did not set a 'Content-Type' header!!!"
+  def get_filename(url, response: nil, info: nil, fileindex: nil, is_album: false)
+    basename = nil
+    # this chunk of awful does not apply to albums
+    if not is_album then
+      parts = URI.parse(url)
+      # get rid of leading slash
+      realpath = parts.path[1 .. -1]
+      # just get the last part (the basename, duh)
+      path = File.basename(realpath)
+      # improvise if that didn't work for some reason
+      path = if path.length == 0 then realpath.gsub("/", "-").gsub("\\", "-") else path end
+      # get rid of the leading dot produced by File.extname
+      ext = File.extname(path)[1 .. -1]
+      # now get the, uh, *actual* file extension ...
+      actual = contenttype_to_ext(response)
+      realext = (((ext == nil) || (ext.size == 0)) ? actual : ext)
+      # let's not mess around, if the content-type isn't some type of image, it's b0rked
+      if (not actual) && (not is_album) then
+        raise ArgumentError, "url #{url.dump} has a funky path, and did not set a 'Content-Type' header!!!"
+      end
+      # construct the new and improved filename
+      # get rid of dot (realext is without leading dot)
+      basename = File.basename(path, realext)[0 .. -2]
     end
-    # construct the new and improved filename
-    basename = File.basename(path, realext).gsub(/\.$/, "")
-    prefix = ((index != nil) ? "#{index}-" : "")
-    return "#{prefix}#{basename}.#{realext}"
+    # make prefix if not nil
+    prefix = (((fileindex != nil) && (not is_album)) ? "#{fileindex}-" : "")
+    # lump it all together
+    threadid = info[:id]
+    username = info[:author].gsub(/[\[\]]/, "")
+    score = info[:score]
+    title = Util::sanitize_filename(info[:title])
+    #if the title is empty, substitute with basename
+    if title.empty? then
+      title = basename
+    end
+    vars =
+    {
+      name:     basename,
+      filename: basename,
+      id:       threadid,
+      thread:   threadid,
+      username: username,
+      author:   username,
+      score:    score,
+      points:   score,
+      created:  info[:created].to_i,
+      title:    title    
+    }
+    tplvars = @opts[:template].dup
+    # warning: hack follows
+    if not fileindex.nil? then
+      # to reduce length of filenames, strip the %{title} tag
+      # if we're downloading images for an album.
+      # technically, we could just erase :title from $vars, but
+      # then there still could be a leading underscore/dash, which would be bad, obviously
+      tplvars.gsub!(/%{title}/, '')
+      # just in case the filename starts with a dash or underscore, or somesuch
+      tplvars.gsub!(/^[\-_]/, '')
+    end
+    formatted = (tplvars % vars)
+    tmp = prefix + formatted
+    if not is_album then
+      tmp << "." << realext
+    end
+    return tmp
   end
 
-  def get_listing(after)
-    section = @opts[:section]
-    listingopts = {t: @opts[:time], limit: @opts[:limit], after: after}
-    case section
-      when "new" then
-        return @client.get_new(@subreddit, listingopts)
-      when "hot" then
-        return @client.get_hot(@subreddit, listingopts)
-      when "top" then
-        return @client.get_top(@subreddit, listingopts)
-      when "controversial" then
-        return @client.get_controversial(@subreddit, listingopts)
-      else
-        raise ArgumentError, "section #{section.dump} is unknown, or not yet handled"
+  def handle_url(url, subfolder: nil, fileindex: nil, info: {})
+    if not fileindex then
+      Logger.putline("thread: #{info[:title].dump} (/r/#{@subreddit}/comments/#{info[:id]})", color: :blue)
     end
-  end
-
-  def handle_url(url, subfolder=nil, fileindex=nil)
     response = Util::download(url, headers: {referer: "https://www.reddit.com/r/#{@subreddit}"})
     if response then
       begin
         if response_is_image(response) then
           dlfolder = (subfolder ? File.join(@destfolder, subfolder) : @destfolder)
-          filename = get_filename(url, response, fileindex)
+          filename = get_filename(url, response: response, fileindex: fileindex, info: info)
           FileUtils.mkdir_p(dlfolder)
           # using chdir() to avoid a possible race condition (relatively unlikely, though)
           Dir.chdir(dlfolder) do
             if not File.file?(filename) then
-              size = response.content_length
+              size = response.content_length || 0
               sizestr = Filesize.new(size).to_f("MB")
-              Logger.putline "writing image to file #{filename.dump}, size: #{sizestr} (#{size} bytes) ...".green
-              File.open(filename, "w") do |fh|
-                while true
-                  data = response.readpartial
-                  break if (data == nil)
-                  fh << data
+              if size >= @maxfilesize then
+                Logger.putline("file is too large (#{sizestr} MB, #{size} bytes)", color: :red)
+              else
+                Logger.putline("writing image to file #{filename.dump} (#{sizestr} MB, #{size} bytes) ...", color: :green)
+                File.open(filename, "w") do |fh|
+                  while true do
+                    data = response.readpartial
+                    break if (data == nil)
+                    fh << data
+                  end
                 end
+                @dlcount += 1
               end
-              @dlcount += 1
             else
-              Logger.putline "already downloaded".yellow
+              Logger.putline("already downloaded", color: :yellow)
             end
-            Logger.putline
           end
         else
           begin
             links = Adapters::tryparse(url, response)
             name = links[:links]
             if links[:images].size == 0 then
-              Logger.putline "didn't find any images!".yellow
+              Logger.putline("didn't find any images!", color: :yellow)
             elsif links[:images].size == 1 then
-              handle_url(links[:images].first[:url])
+              handle_url(links[:images].first[:url], info: info)
             else
-              albumfolder = "album_#{links[:name]}"
-              Logger.putline "downloading album to subdirectory #{albumfolder.dump} ...".green
+              #albumfolder = "album_#{links[:name]}_#{info[:id]}"
+              albumfolder = "album_#{get_filename(nil, info: info, is_album: true)}"
+              Logger.putline("downloading album to subdirectory #{albumfolder.dump} ...", color: :green)
               Logger.indent += 1
               links[:images].each_with_index do |img, idx|
-                handle_url(img[:url], albumfolder, idx)
+                handle_url(img[:url], subfolder: albumfolder, fileindex: idx, info: info)
               end
               Logger.indent -= 1
             end
           rescue => err
-            Logger.putline "couldn't process page: (#{err.class}) #{err.message}".red
+            Logger.putline("couldn't process page: (#{err.class}) #{err.message}", color: :red)
+            pp err.backtrace
           end
         end
       rescue => err
-        Logger.putline "error: #{err.message}".red
+        Logger.putline("error: #{err.message}", color: :red)
+        pp err.backtrace
       end
     else
-      Logger.putline "skipping: downloading failed!".red
+      Logger.putline("skipping: downloading failed!", color: :red)
     end
     # end of handle_url
+  end
+
+  def get_listing(after)
+    section = @opts[:section]
+    listingopts = {t: @opts[:time], limit: @opts[:limit], after: after}
+    begin
+      case section
+        when "new" then
+          return @client.get_new(@subreddit, listingopts)
+        when "hot" then
+          return @client.get_hot(@subreddit, listingopts)
+        when "top" then
+          return @client.get_top(@subreddit, listingopts)
+        when "controversial" then
+          return @client.get_controversial(@subreddit, listingopts)
+        else
+          raise ArgumentError, "section #{section.dump} is unknown, or not yet handled"
+      end
+    rescue Redd::Error::PermissionDenied => err
+      Logger.putline("cannot access /r/#{@subreddit}: #{err}", color: :red)
+      return nil
+    rescue Redd::Error => err
+      # most likely reason is that session has timed out
+      # if login fails, let error propagate
+      Logger.putline("received client error #{err.class}: #{err.message}", color: :red)
+      Logger.putline("trying to login again", color: :red)
+      login
+      return get_listing(after)
+    end
   end
 
   def walk_subreddit(after=nil)
     # todo: cache results? how? where?
     links = get_listing(after)
-    $stderr.puts "++ received #{links.size} links ..."
-    links.each do |chunk|
-      url = Adapters::fixurl(chunk[:url])
-      # neither title nor permalink are used (yet)
-      # maybe create some kind of directory structure?
-      title = chunk[:title]
-      permalink = chunk[:permalink]
-      isself = chunk[:is_self]
-      if not isself then
-        handle_url(url)
+    if (links.nil?) || (links.empty?) then
+      Logger.putline("get_listing didn't return anything")
+      @pagecounter = 0
+    else
+      $stderr.puts "++ received #{links.size} links ..."
+      links.each do |chunk|
+        begin
+          url = Adapters::fixurl(chunk[:url].scrub.force_encoding("ascii"))
+          title = chunk[:title]
+          permalink = chunk[:permalink]
+          isself = chunk[:is_self]
+          if not isself then
+            handle_url(url, info: chunk)
+            Logger.putline
+          end
+        rescue URI::InvalidURIError => err
+          Logger.putline("URI::InvalidURIError: #{err.message}", color: :red)
+        end
       end
     end
     if @pagecounter == 0 then
@@ -404,17 +515,46 @@ class ReddPics
     end
   end
 
-  def initialize(client, subreddit, opts)
-    @client = client
+  def login
+    @client = Redd.it(:script,
+      @authinfo[:appid],
+      @authinfo[:apikey],
+      @authinfo[:username],
+      @authinfo[:password],
+      user_agent: "ImageDownloader (ver1.0)"
+    )
+    @client.authorize!
+  end
+
+  def initialize(authinfo, subreddit, opts)
+    @authinfo = authinfo
     @subreddit = subreddit
     @opts = opts
     @destfolder = @opts[:outputdir]
     @section = @opts[:section]
     @pagecounter = @opts[:maxpages] - 1
+    @maxfilesize = Filesize.from(@opts[:filesize]).to_i
     @dlcount = 0
+    @loghandle = nil
+    if @opts[:logfile] then
+      @logfile = sprintf(@opts[:logfile], @subreddit)
+      @loghandle = File.open(@logfile, "wb")
+      @loghandle.puts "### file generated by reddpics for /r/#{@subreddit}"
+      @loghandle.puts "### logging started: #{Time.now}"
+      @loghandle.puts
+      Logger.putline("logfile will be written to #{@logfile.dump}")
+      Logger.otherfile = @loghandle
+    end
+    login
     begin
       walk_subreddit
     ensure
+      if @loghandle then
+        $stderr.puts "=== closing log #{@logfile}"
+        @loghandle.puts
+        @loghandle.puts "### logging finished: #{Time.now}\n"
+        @loghandle.close
+      end
       $stderr.puts "=== statistics:"
       $stderr.puts "=== downloaded #{@dlcount} images"
     end
@@ -426,6 +566,8 @@ opts = Trollop::options do
     "Usage: #{File.basename $0} <subreddit ...> [<options>]\n" +
     "Valid options:"
   )
+  opt(:logfile,    "if set, log will also be written to this file. as with '-o', you can use %s as template",
+    type: String, short: "-d", default: nil)
   opt(:outputdir,
       "Output directory to download images to. default is './r_<subredditname>'.\n" + 
       "You can use '%s' as template (for example, when downloading from several subreddits)",
@@ -433,13 +575,23 @@ opts = Trollop::options do
   opt(:maxpages,  "Maximum pages to fetch (note: values over 10 may not work!)",
     type: Integer, default: 10)
   opt(:filesize,  "Maximum filesize for images",
-    type: Integer, default: Filesize.from("5 MB").to_i)
+    type: String, default: "10MB")
   opt(:limit,     "How many links to fetch per page. Maximum value is 100",
     type: Integer, default: 100)
   opt(:section,   "What to download. options are 'new', 'hot', 'top', and 'controversial'.",
     type: String, default: "top")
   opt(:time,      "From which timespan to download. options are 'day', 'week', 'month', 'year', and 'all'.",
     type: String, default: "all")
+  opt(:template,  "Filename template to use when downloading files. extension is automatically added.\n" +
+                  "album indexes are added irregardless of the template chosen.\n" +
+                  "valid variables:\n"+
+                  "  %{name}     - the extracted filename, minus file extension\n" +
+                  "  %{title}    - the cleaned up title of the thread\n" +
+                  "  %{id}       - reddit thread id (i.e., http://reddit.com/r/subreddit/comments/<id>/...)\n" +
+                  "  %{username} - reddit username ('deleted' when user deleted their account)\n" +
+                  "  %{score}    - votes score\n" +
+                  "  %{created}  - UNIX timestamp at which time the link was submitted\n",
+    type: String, default: "%{title}-%{id}")
   opt(:username,  "Your reddit username - overrides 'REDDPICS_USERNAME'",
     type: String)
   opt(:password,  "Your reddit password - overrides 'REDDPICS_PASSWORD'",
@@ -465,10 +617,7 @@ elsif ARGV.size > 0 then
   Trollop::die(:maxpages, "value must be larger than zero") if opts[:maxpages] == 0
   Trollop::die(:apikey,   "must be set (try '--apihelp')") if not authinfo[:apikey]
   Trollop::die(:time,     "uses an invalid timespan") if not opts[:time].match(/^(day|week|month|year|all)$/)
-  client = Redd.it(:script, authinfo[:appid], authinfo[:apikey], authinfo[:username], authinfo[:password],
-    user_agent: "ImageDownloader (ver1.0)"
-  )
-  client.authorize!
+  Trollop::die(:filesize, "must have a proper size suffix") if not opts[:filesize].match(/^\d+[kmgtpezy]b$/i)
   ARGV.each do |subreddit|
     instanceopts = opts.dup
     if opts[:outputdir] then
@@ -480,7 +629,7 @@ elsif ARGV.size > 0 then
       instanceopts[:outputdir] = "./r_#{subreddit}"
     end
     String.disable_colorization(true) if not $stderr.tty?
-    ReddPics.new(client, subreddit, instanceopts)
+    ReddPics.new(authinfo, subreddit, instanceopts)
   end
 else
   puts "usage: #{File.basename $0} <subreddit> [ -o <destination-folder> [... <other options>]]"
