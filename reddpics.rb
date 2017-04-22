@@ -3,6 +3,7 @@
 require "fileutils"
 require "uri"
 require "uri/http"
+require "cgi"
 require "pp"
 require "http"
 require "redd"
@@ -105,15 +106,21 @@ end
 
 module Util
   def self.download(url, headers: {}, maxredirs: 5)
+    now = Time.now
+    tstamp =  sprintf("%02d:%02d:%02d", now.hour, now.min, now.sec)
     # maybe add {"accept-encoding" => "identity"}?
-    Logger.put("wget(#{url.dump}) ... ")
+    Logger.put("[#{tstamp}] wget(#{url.dump}) ... ")
     begin
       #headers["accept-encoding"] = "identity"
-      response = HTTP.headers(headers).follow(true).get(url)
+      response = HTTP.timeout(:global, :write => 2, :connect => 2, :read => 2).headers(headers).follow(true).get(url)
       if response.code >= 400 then
         Logger.write("failed: HTTP status #{response.code} #{response.reason}\n", color: :red)
         return nil
       else
+        # when an image had been removed from imgur, the image
+        # url (i.e., http://i.imgur.com/whatever.jpg) does a 302 to
+        # /removed.png, which, itself, is served as 200 OK.
+        # hence this hack.
         if response.uri.path.match("/removed.png") then
           Logger.write("failed: image has been removed (imgur hackery)\n", color: :red)
           return nil
@@ -233,7 +240,7 @@ module Adapters
     end
   end
 
-  def self.flickrdl(url, response)
+  def self.noembed(url, response)
     jsonurl = Util::build_uri({
       scheme: "https",
       host: "noembed.com",
@@ -241,7 +248,7 @@ module Adapters
       query: "url=#{url}"
     })
     jsonresponse = Util::download(jsonurl.to_s)
-    if jsonrsesponse then
+    if jsonresponse then
       jsondata = JSON.parse(jsonresponse.to_s)
       if (mediaurl = jsondata["media_url"]) != nil then
         return {name: nil, images: [{url: mediaurl, title: jsondata["title"], description: nil}]}
@@ -251,6 +258,14 @@ module Adapters
     else
       raise ArgumentError, "noembed.com call failed"
     end
+  end
+
+  def self.flickrdl(url, response)
+    return self.noembed(url, response)
+  end
+
+  def self.deviantartdl(url, response)
+    return self.noembed(url, response)
   end
 
   # attempt to avoid redirects (in an extremely primitive way)
@@ -279,13 +294,22 @@ module Adapters
       return Adapters::gfycatdl(url, response)
     elsif (parts.host == "flickr.com") || (parts.host == "www.flickr.com") || (parts.host == "flic.kr") then
       return Adapters.flickrdl(url, response)
+    elsif (parts.host.match(/.*\.deviantart.com$/)) then
+      return Adapters.deviantartdl(url, response)
     else
+      # todo: do username subdomain check for deviantart
       raise NoAdapterError, "no adapter for #{parts.host.to_s.dump}"
     end
   end
 end
 
 class ReddPics
+  # this variable is modified with each call of ReddPics
+  # to keep track of total downloaded files
+  @@total_downloaded = 0
+
+  # primitive content_type check for mime types we can actually
+  # use
   def response_is_image(response)
     contenttype = response.mime_type
     if contenttype == nil then
@@ -295,6 +319,7 @@ class ReddPics
     return (contenttype.match("^image/") || contenttype.match("^video/webm"))
   end
 
+  # turn a mime type into an extension we can use
   def contenttype_to_ext(response)
     contenttype = response.mime_type
     if contenttype then
@@ -318,6 +343,7 @@ class ReddPics
     end
   end
 
+  # extract a safe-ish, reusable filename
   def get_filename(url, response: nil, info: nil, fileindex: nil, is_album: false)
     basename = nil
     # this chunk of awful does not apply to albums
@@ -345,10 +371,10 @@ class ReddPics
     # make prefix if not nil
     prefix = (((fileindex != nil) && (not is_album)) ? "#{fileindex}-" : "")
     # lump it all together
-    threadid = info[:id]
-    username = info[:author].gsub(/[\[\]]/, "")
-    score = info[:score]
-    title = Util::sanitize_filename(info[:title])
+    threadid = info.id
+    username = info.author.name.gsub(/[\[\]]/, "")
+    score = info.score
+    title = Util::sanitize_filename(info.title)
     #if the title is empty, substitute with basename
     if title.empty? then
       title = basename
@@ -363,7 +389,7 @@ class ReddPics
       author:   username,
       score:    score,
       points:   score,
-      created:  info[:created].to_i,
+      created:  info.created.to_i,
       title:    title    
     }
     tplvars = @opts[:template].dup
@@ -387,7 +413,7 @@ class ReddPics
 
   def handle_url(url, subfolder: nil, fileindex: nil, info: {})
     if not fileindex then
-      Logger.putline("thread: #{info[:title].dump} (/r/#{@subreddit}/comments/#{info[:id]})", color: :blue)
+      Logger.putline("thread: #{info.title.dump} (https://redd.it/#{info.id})", color: :blue)
     end
     response = Util::download(url, headers: {referer: "https://www.reddit.com/r/#{@subreddit}"})
     if response then
@@ -413,7 +439,7 @@ class ReddPics
                   end
                 end
                 @dlcount += 1
-                @cachedlinks[info[:id]] = info
+                @cachedlinks[info.id] = info
               end
             else
               Logger.putline("already downloaded", color: :yellow)
@@ -458,23 +484,23 @@ class ReddPics
     begin
       case section
         when "new" then
-          return @client.get_new(@subreddit, listingopts)
+          return @client.subreddit(@subreddit, listingopts).new(listingopts)
         when "hot" then
-          return @client.get_hot(@subreddit, listingopts)
+          return @client.subreddit(@subreddit, listingopts).hot(listingopts)
         when "top" then
-          return @client.get_top(@subreddit, listingopts)
+          return @client.subreddit(@subreddit).top(listingopts)
         when "controversial" then
-          return @client.get_controversial(@subreddit, listingopts)
+          return @client.subreddit(@subreddit).controversial(listingopts)
         else
           raise ArgumentError, "section #{section.dump} is unknown, or not yet handled"
       end
-    rescue Redd::Error::PermissionDenied => err
+    rescue Redd::Forbidden => err
       Logger.putline("cannot access /r/#{@subreddit}: #{err}", color: :red)
       return nil
-    rescue Redd::Error::BadGateway, Redd::Error::BadRequest, Redd::Error::InternalServerError => err
+    rescue Redd::ServerError => err
       Logger.putline("#{err.class}: something went really wrong", color: :red)
       return nil
-    rescue Redd::Error::ExpiredCode => err
+    rescue Redd::TokenRetrievalError => err
       # most likely reason is that session has timed out
       # if login fails, let error propagate
       Logger.putline("received client error #{err.class}: #{err.message}", color: :red)
@@ -488,7 +514,7 @@ class ReddPics
         Logger.putline("Aborting")
         return nil
       end
-    rescue Redd::Error => err
+    rescue Redd::APIError => err
       Logger.putline("Unhandled #{err.class}: #{err}")
       return nil
     end
@@ -500,15 +526,14 @@ class ReddPics
       Logger.putline("get_listing didn't return anything", color: :red)
     else
       begin
-        $stderr.puts "++ received #{links.size} links ..."
+        $stderr.puts "++ received #{links.to_a.size} links ..."
         links.each do |chunk|
           begin
-            id = chunk[:id]
-            # 
-            url = Adapters::fixurl(chunk[:url].scrub.force_encoding("ascii"))
-            title = chunk[:title]
-            permalink = chunk[:permalink]
-            isself = chunk[:is_self]
+            id = chunk.id
+            url = Adapters::fixurl(chunk.url.scrub.force_encoding("ascii"))
+            title = chunk.title
+            permalink = chunk.permalink
+            isself = chunk.is_self
             if not isself then
               if @cachedlinks.has_key?(id) then
                 Logger.putline("/r/#{@subreddit}: already seen thread #{id} (title: #{title.dump}, url: #{url.dump})", color: :green)
@@ -536,14 +561,13 @@ class ReddPics
   end
 
   def login
-    @client = Redd.it(:script,
-      @authinfo[:appid],
-      @authinfo[:apikey],
-      @authinfo[:username],
-      @authinfo[:password],
+    @client = Redd.it(
+      client_id: @authinfo[:appid],
+      secret: @authinfo[:apikey],
+      username: @authinfo[:username],
+      password: @authinfo[:password],
       user_agent: "ImageDownloader (ver1.0)"
     )
-    @client.authorize!
     @loginattempts += 1
   end
 
@@ -562,6 +586,7 @@ class ReddPics
     @cachefile = File.join(@destfolder, ".cache_#{@subreddit}.json")
     @cachedlinks = {}
     @cachemode = "w"
+    FileUtils.mkdir_p(@destfolder)
     if @opts[:logfile] then
       @logfile = sprintf(@opts[:logfile], @subreddit)
       @loghandle = File.open(@logfile, "wb")
@@ -579,7 +604,11 @@ class ReddPics
           raise IOError, "cache file #{@cachefile} is not a regular file!"
         end
         # now load the file
-        @cachedlinks = JSON.load(File.read(@cachefile))
+        begin
+          @cachedlinks = JSON.load(File.read(@cachefile))
+        rescue JSON::JSONError => err
+          Logger.putline("could not load cache from #{@cachefile}: (#{err.class}) #{err.message}", color: :red)
+        end
       end
       walk_subreddit
     ensure
@@ -589,10 +618,14 @@ class ReddPics
         @loghandle.puts("### logging finished: #{Time.now}\n")
         @loghandle.close
       end
+      @@total_downloaded += @dlcount
       Logger.putline("=== statistics for /r/#{@subreddit}:")
       Logger.putline("=== downloaded #{@dlcount} images")
+      Logger.putline("=== and #{@@total_downloaded} in total")
       begin
+        $stderr.puts("writing cache (please be patient!) ...")
         File.open(@cachefile, @cachemode) do |fh|
+          #fh << JSON.pretty_generate(@cachedlinks)
           fh << JSON.dump(@cachedlinks)
         end
       rescue => err
@@ -610,7 +643,7 @@ opts = Trollop::options do
     "Valid options:"
   )
   opt(:logfile,    "if set, log will also be written to this file. as with '-o', you can use %s as template",
-    type: String, short: "-d", default: nil)
+    type: String, short: "-d", default: "log_%s.txt")
   opt(:outputdir,
       "Output directory to download images to. default is './r_<subredditname>'.\n" + 
       "You can use '%s' as template (for example, when downloading from several subreddits)",
@@ -670,7 +703,7 @@ elsif ARGV.size > 0 then
         instanceopts[:outputdir] = sprintf(opts[:outputdir], subreddit)
       end
     else
-      instanceopts[:outputdir] = "./r_#{subreddit}"
+      instanceopts[:outputdir] = subreddit
     end
     String.disable_colorization(true) if not $stderr.tty?
     ReddPics.new(authinfo, subreddit, instanceopts)
