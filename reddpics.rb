@@ -660,7 +660,7 @@ opts = Trollop::options do
     type: String, default: "all")
   opt(:template, \
       "Filename template to use when downloading files. extension is automatically added.\n" +
-      "album indexes are added irregardless of the template chosen.\n" +
+      "album indexes are added regardless of the template chosen.\n" +
       "valid variables:\n"+
       "  %{name}     - the extracted filename, minus file extension\n" +
       "  %{title}    - the cleaned up title of the thread\n" +
