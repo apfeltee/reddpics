@@ -5,8 +5,8 @@ require "uri"
 require "uri/http"
 require "cgi"
 require "pp"
-require "http"
 require "redd"
+require "http"
 require "nokogiri"
 require "trollop"
 require "colorize"
@@ -52,6 +52,7 @@ like REDDPICS_APIKEY, etc, in the usual fashion.
 
 And that's it! Sounds complicated, but it really isn't. Really!
 }.strip
+
 
 # exceptions
 class NoAdapterError < StandardError
@@ -130,6 +131,7 @@ module Util
       return response
     rescue => err
       Logger.write("failed: (#{err.class}) #{err.message}\n", color: :red)
+      $stderr.puts(err.backtrace)
       return nil
     end
   end
@@ -560,6 +562,21 @@ class ReddPics
     end
   end
 
+  def writecache
+    begin
+      $stderr.puts("writing cache (please be patient!) ...")
+      File.open(@cachefile, @cachemode) do |fh|
+        #fh << JSON.pretty_generate(@cachedlinks)
+        #fh << JSON.dump(@cachedlinks)
+        JSON.dump(@cachedlinks, fh)
+      end
+    rescue => err
+      Logger.putline("failed to write cache to #{@cachefile}: (#{err.class}) #{err}")
+    else
+      $stderr.puts("=== wrote cache to #{@cachefile}")
+    end
+  end
+
   def login
     @client = Redd.it(
       client_id: @authinfo[:appid],
@@ -622,95 +639,86 @@ class ReddPics
       Logger.putline("=== statistics for /r/#{@subreddit}:")
       Logger.putline("=== downloaded #{@dlcount} images")
       Logger.putline("=== and #{@@total_downloaded} in total")
-      begin
-        $stderr.puts("writing cache (please be patient!) ...")
-        File.open(@cachefile, @cachemode) do |fh|
-          #fh << JSON.pretty_generate(@cachedlinks)
-          fh << JSON.dump(@cachedlinks)
+      writecache
+    end
+  end
+end
+
+begin
+  opts = Trollop::options do
+    banner (
+      "Usage: #{File.basename $0} <subreddit ...> [<options>]\n" +
+      "Valid options:"
+    )
+    opt(:logfile,    "if set, log will also be written to this file. as with '-o', you can use %s as template",
+      type: String, short: "-d", default: "log_%s.txt")
+    opt(:outputdir,
+        "Output directory to download images to. default is './r_<subredditname>'.\n" + 
+        "You can use '%s' as template (for example, when downloading from several subreddits)",
+      type: String)
+    opt(:maxpages,  "Maximum pages to fetch (note: values over 10 may not work!)",
+      type: Integer, default: 10)
+    opt(:filesize,  "Maximum filesize for images",
+      type: String, default: "10MB")
+    opt(:limit,     "How many links to fetch per page. Maximum value is 100",
+      type: Integer, default: 100)
+    opt(:section,   "What to download. options are 'new', 'hot', 'top', and 'controversial'.",
+      type: String, default: "top")
+    opt(:time,      "From which timespan to download. options are 'day', 'week', 'month', 'year', and 'all'.",
+      type: String, default: "all")
+    opt(:template, \
+        "Filename template to use when downloading files. extension is automatically added.\n" +
+        "album indexes are added regardless of the template chosen.\n" +
+        "valid variables:\n"+
+        "  %{name}     - the extracted filename, minus file extension\n" +
+        "  %{title}    - the cleaned up title of the thread\n" +
+        "  %{id}       - reddit thread id (i.e., http://reddit.com/r/subreddit/comments/<id>/...)\n" +
+        "  %{username} - reddit username ('deleted' when user deleted their account)\n" +
+        "  %{score}    - votes score\n" +
+        "  %{created}  - UNIX timestamp at which time the link was submitted\n",
+      type: String, default: "%{title}-%{id}")
+    opt(:username,  "Your reddit username - overrides 'REDDPICS_USERNAME'",
+      type: String)
+    opt(:password,  "Your reddit password - overrides 'REDDPICS_PASSWORD'",
+      type: String)
+    opt(:apikey,    "Your API key - overrides 'REDDPICS_APIKEY'",
+      type: String)
+    opt(:appid,     "Your API appid - overrides 'REDDPICS_APPID'",
+      type: String)
+    opt(:apihelp,   "Prints a quick'n'dirty explanation how to get your API credentials", short: "-#")
+  end
+
+  if opts[:apihelp] then
+    puts APIHELPSTRING
+  elsif ARGV.size > 0 then
+    authinfo =
+    {
+      appid:    opts[:appid]    || ENV["REDDPICS_APPID"],
+      apikey:   opts[:apikey]   || ENV["REDDPICS_APIKEY"],
+      username: opts[:username] || ENV["REDDPICS_USERNAME"],
+      password: opts[:password] || ENV["REDDPICS_PASSWORD"],
+    }
+    Trollop::die(:limit,    "must be less than 100") if opts[:limit] > 100
+    Trollop::die(:maxpages, "value must be larger than zero") if opts[:maxpages] == 0
+    Trollop::die(:apikey,   "must be set (try '--apihelp')") if not authinfo[:apikey]
+    Trollop::die(:time,     "uses an invalid timespan") if not opts[:time].match(/^(day|week|month|year|all)$/)
+    Trollop::die(:filesize, "must have a proper size suffix") if not opts[:filesize].match(/^\d+[kmgtpezy]b$/i)
+    ARGV.each do |subreddit|
+      instanceopts = opts.dup
+      if opts[:outputdir] then
+        if opts[:outputdir].match(/%s/) then
+          # instead of using sprintf, use String#% and %{whatever} notion?
+          instanceopts[:outputdir] = sprintf(opts[:outputdir], subreddit)
         end
-      rescue => err
-        Logger.putline("failed to write cache to #{@cachefile}: (#{err.class}) #{err}")
       else
-        $stderr.puts("=== wrote cache to #{@cachefile}")
+        instanceopts[:outputdir] = subreddit
       end
+      String.disable_colorization(true) if not $stderr.tty?
+      ReddPics.new(authinfo, subreddit, instanceopts)
     end
+  else
+    puts "usage: #{File.basename $0} <subreddit> [ -o <destination-folder> [... <other options>]]"
+    puts "try #{File.basename $0} --help for other options"
   end
 end
-
-opts = Trollop::options do
-  banner (
-    "Usage: #{File.basename $0} <subreddit ...> [<options>]\n" +
-    "Valid options:"
-  )
-  opt(:logfile,    "if set, log will also be written to this file. as with '-o', you can use %s as template",
-    type: String, short: "-d", default: "log_%s.txt")
-  opt(:outputdir,
-      "Output directory to download images to. default is './r_<subredditname>'.\n" + 
-      "You can use '%s' as template (for example, when downloading from several subreddits)",
-    type: String)
-  opt(:maxpages,  "Maximum pages to fetch (note: values over 10 may not work!)",
-    type: Integer, default: 10)
-  opt(:filesize,  "Maximum filesize for images",
-    type: String, default: "10MB")
-  opt(:limit,     "How many links to fetch per page. Maximum value is 100",
-    type: Integer, default: 100)
-  opt(:section,   "What to download. options are 'new', 'hot', 'top', and 'controversial'.",
-    type: String, default: "top")
-  opt(:time,      "From which timespan to download. options are 'day', 'week', 'month', 'year', and 'all'.",
-    type: String, default: "all")
-  opt(:template, \
-      "Filename template to use when downloading files. extension is automatically added.\n" +
-      "album indexes are added regardless of the template chosen.\n" +
-      "valid variables:\n"+
-      "  %{name}     - the extracted filename, minus file extension\n" +
-      "  %{title}    - the cleaned up title of the thread\n" +
-      "  %{id}       - reddit thread id (i.e., http://reddit.com/r/subreddit/comments/<id>/...)\n" +
-      "  %{username} - reddit username ('deleted' when user deleted their account)\n" +
-      "  %{score}    - votes score\n" +
-      "  %{created}  - UNIX timestamp at which time the link was submitted\n",
-    type: String, default: "%{title}-%{id}")
-  opt(:username,  "Your reddit username - overrides 'REDDPICS_USERNAME'",
-    type: String)
-  opt(:password,  "Your reddit password - overrides 'REDDPICS_PASSWORD'",
-    type: String)
-  opt(:apikey,    "Your API key - overrides 'REDDPICS_APIKEY'",
-    type: String)
-  opt(:appid,     "Your API appid - overrides 'REDDPICS_APPID'",
-    type: String)
-  opt(:apihelp,   "Prints a quick'n'dirty explanation how to get your API credentials", short: "-#")
-end
-
-if opts[:apihelp] then
-  puts APIHELPSTRING
-elsif ARGV.size > 0 then
-  authinfo =
-  {
-    appid:    opts[:appid]    || ENV["REDDPICS_APPID"],
-    apikey:   opts[:apikey]   || ENV["REDDPICS_APIKEY"],
-    username: opts[:username] || ENV["REDDPICS_USERNAME"],
-    password: opts[:password] || ENV["REDDPICS_PASSWORD"],
-  }
-  Trollop::die(:limit,    "must be less than 100") if opts[:limit] > 100
-  Trollop::die(:maxpages, "value must be larger than zero") if opts[:maxpages] == 0
-  Trollop::die(:apikey,   "must be set (try '--apihelp')") if not authinfo[:apikey]
-  Trollop::die(:time,     "uses an invalid timespan") if not opts[:time].match(/^(day|week|month|year|all)$/)
-  Trollop::die(:filesize, "must have a proper size suffix") if not opts[:filesize].match(/^\d+[kmgtpezy]b$/i)
-  ARGV.each do |subreddit|
-    instanceopts = opts.dup
-    if opts[:outputdir] then
-      if opts[:outputdir].match(/%s/) then
-        # instead of using sprintf, use String#% and %{whatever} notion?
-        instanceopts[:outputdir] = sprintf(opts[:outputdir], subreddit)
-      end
-    else
-      instanceopts[:outputdir] = subreddit
-    end
-    String.disable_colorization(true) if not $stderr.tty?
-    ReddPics.new(authinfo, subreddit, instanceopts)
-  end
-else
-  puts "usage: #{File.basename $0} <subreddit> [ -o <destination-folder> [... <other options>]]"
-  puts "try #{File.basename $0} --help for other options"
-end
-
 
