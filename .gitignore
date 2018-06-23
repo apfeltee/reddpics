@@ -1,0 +1,9 @@
+
+reducesize.rb
+*.txt
+*.cfg
+*.yml
+*.yaml
+*.json
+*.html
+

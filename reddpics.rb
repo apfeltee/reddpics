@@ -5,6 +5,7 @@ require "uri"
 require "uri/http"
 require "cgi"
 require "pp"
+require "yaml"
 require "redd"
 require "http"
 require "nokogiri"
@@ -136,6 +137,24 @@ module Util
     end
   end
 
+  def self.file_exists?(path, altexts=[".webp"])
+    if not File.file?(path) then
+      bname = File.basename(path)
+      dirn = File.dirname(path)
+      extn = File.extname(bname)
+      blank = File.basename(bname, extn)
+      altexts.each do |ext|
+        fname = sprintf("%s%s", blank, ext)
+        fpath = File.join(dirn, fname)
+        if File.file?(fpath) then
+          return true
+        end
+      end
+      return false
+    end
+    return true
+  end
+
   # for reasons i cannot comprehend, URI::HTTP.build doesn't support a scheme option
   # can't make that shit up even if i tried
   def self.build_uri(opts)
@@ -164,85 +183,162 @@ module Util
     # finally, strip down to $max_length
     return filename[0 .. max_length]
   end
-end
 
-module Adapters
-  # disgusting hack incoming
-  def self.imgurdl(url, response)
-    Logger.putline("scanning imgur page ...", color: :cyan)
-    parts = URI.parse(url)
-    result = {name: nil, title: "", images: []}
-    title = nil
-    # further check if it's actually something extractable
-    if not parts.host.match(/^((i|m)\.imgur|imgur|www\.imgur)\.com$/) then
-      raise ArgumentError, "url #{url.dump} does not look like an imgur url"
-    elsif (not parts.path) || (parts.path == "/") then
-      raise ArgumentError, "can't download the entire frontpage. sorry :<"
-    end
-    # user favorites are almost guaranteed to fail.
-    # don't be mad at me, be mad at imgur for their shitty API
-    if parts.path.match("^/a/") then
-      result[:name] = parts.path.split("/")[-1]
-      source = "http://imgur.com/ajaxalbums/getimages/#{result[:name]}/hit.json"
-      response = Util::download(source)
-      if not response then
-        raise ArgumentError, "could not download json information (#{source.dump})"
-      end
-      json = JSON.load(response.to_s)
-      # how not to write an api: json.success returns true even if json.data is empty
-      if (json["success"] == true) && (json["data"] != []) then
-        json["data"]["images"].each do |imgchunk|
-          finalurl = "http://i.imgur.com/#{imgchunk["hash"]}#{imgchunk["ext"]}"
-          result[:images] << {url: finalurl, title: imgchunk["title"], description: imgchunk["description"]}
-        end
-      else
-        if json["success"] != true then
-          raise ArgumentError, "json was successfully downloaded and parsed, but key 'success' is false?"
-        else
-          raise ArgumentError, "key 'data' is just an empty array; probably not an album ..."
-        end
-      end
-    else
-      result[:name] = parts.path.split("/")[-1]
-      document = Nokogiri::HTML(response.to_s)
-      # this fails *very* often, so best to avoid it for now
-      #result[:title] = document.css(".post-title").first
-      document.css(".post-image-container>div").each do |node|
-        # need to do sub-selection, because some images are wrapped in <a> for zooming
-        img = node.css("img").first
-        if img && img.attributes && img.attributes["src"] then
-          srcattrib = img.attributes["src"]
-          if srcattrib then
-            url = srcattrib.value
-            if url.start_with?("//") then
-              url = "http:" + url
-            end
-            result[:images] << {url: url, title: "", description: ""}
+  def self.read_local_configfile(name: "reddpics")
+    cfgpath = File.expand_path("~/.#{name}.cfg")
+    if File.file?(cfgpath) then
+      begin
+        rt = YAML.load_file(cfgpath).map{|k, v| [k.to_sym, v]}.to_h
+        Logger.putline("configfile: loaded configuration file #{cfgpath.dump}")
+        failed = false
+        %i(redditusername redditpassword redditapikey redditappid).each do |k|
+          if not rt.include?(k) then
+            Logger.putline("configfile: missing key #{k.to_s.dump}!")
+            failed = true
           end
         end
+        #if not failed then
+          return rt
+        #end
+      rescue => ex
+        Logger.putline("configfile: YAML.load_file failed: (#{ex.class}) #{ex.message}")
       end
+    else
+      Logger.putline("configfile: file #{cfgpath.dump} does not exist")
+    end
+    return {}
+  end
+
+  def self.get_local_config_with_opts(opts)
+    confrt = read_local_configfile
+    # no config file, or parsing failed, so try env instead.
+    # this is for backwards compatibility ONLY!
+    # will be removed in the future, because setting env is
+    # a crazy huge security hole.
+    if confrt.nil? then
+      failed = false
+      authinfo = {}
+      tmpinfo =
+      {
+        redditappid:    [opts[:redditappid], ENV["REDDPICS_APPID"]],
+        redditapikey:   [opts[:redditapikey], ENV["REDDPICS_APIKEY"]],
+        redditusername: [opts[:redditusername], ENV["REDDPICS_USERNAME"]],
+        redditpassword: [opts[:redditpassword], ENV["REDDPICS_PASSWORD"]],
+      }
+      Logger.putline("localconfig: trying commandline options, and environment variables")
+      tmpinfo.each do |k, v|
+        optval, envval = v
+        if optval.nil? && envval.nil? then
+          failed = true
+          Logger.putline("localconfig: key #{k.to_s.dump} has neither an option value, nor an environment value!", color: :red)
+        else
+          authinfo[k.to_sym] = (optval || envval)
+        end
+      end
+      if not failed then
+        return authinfo
+      end
+    else
+      return confrt
+    end
+    Logger.putline("localconfig: No login information available! Try 'reddpics --help'.", color: :red)
+    return nil
+  end
+
+  # attempt to avoid redirects (in an extremely primitive way)
+  def self.fixurl(url)
+    parts = URI.parse(url.scrub)
+    if parts.host.match(/^(www\.)?gfycat.com/) then
+      # http:// will always redirect to https://, and www.gfycat.com
+      # seems to always redirect to gfycat.com ...
+      # hence this correction here.
+      parts.scheme = "https"
+      if parts.host == "www.gfycat.com" then
+        parts.host = "gfycat.com"
+      end
+      return parts.to_s
+    elsif parts.host == "i.reddituploads.com" then
+      # reddit stores their urls for reddituploads.com
+      # with escaped elements - which garbles the access code, thus
+      # making the actual url inaccessible. this'll (usually) fix it.
+      return CGI.unescapeHTML(url)
+    elsif (parts.host == "i.imgur.com") && parts.path.end_with?(".gifv") then
+      # imgur has an admittedly neat feature, in which gifs are automatically
+      # converted to webm or mp4, BUT .gifv is obviously not a real thing;
+      # instead it is a placeholder document page that embeds the new
+      # converted video. extracting that video is possible per-se, but
+      # imgur seems to rather aggressively redirect from the .gifv page to
+      # the gallery page! so just use the old .gif, even if it's a few dozen
+      # times larger.
+      parts.path.gsub!(/\.gifv/, ".gif")
+      return parts.to_s
+    end
+    return url
+  end
+end
+
+class Adapters
+  def initialize(authinfo, opts)
+    @authinfo = authinfo
+    @opts = opts
+    @haveimgurapi = false
+    if @authinfo[:imgurappid] then
+      @haveimgurapi = true
+    else
+      Logger.putline("no app-id registered for imgur! scraping will not be available.")
+    end
+  end
+
+  # disgusting hack incoming:
+  # all of this is completely stupid.
+  # imgur changed their pages, so as to make it impossible
+  # to scrape albums etc. without an api key.
+
+  def imgurmakeuri(typ, id)
+    # these are the most common types. there are many others, but idgaf atm
+    mapping = {
+      :album => "https://api.imgur.com/3/album/%s/images",
+      :gallery => "https://api.imgur.com/3/gallery/%s/images",
+      :image => "https://api.imgur.com/3/image/%s",
+    }
+    if mapping.key?(typ) then
+      return sprintf(mapping[typ], id)
+    end
+    raise NoAdapterError, "imgur-api: unknown/unimplemented type #{typ}"
+  end
+
+  def imgurapi(typ, id)
+    appid = @authinfo[:imgurappid]
+    uri = imgurmakeuri(typ, id)
+    clheader = sprintf("Client-ID %s", appid)
+    res = Util::download(uri, headers: {"Authorization" => clheader})
+    rawjson = res.body.to_s
+    parsedjson = JSON.parse(rawjson)
+    if parsedjson["success"] == true then
+      # the json view might just be a map. if so, return it as an array
+      data = parsedjson["data"]
+      if data.is_a?(Array) then
+        return data
+      end
+      return [data]
+    end
+    return []
+  end
+
+  def imgurdl(typ, id)
+    result = {name: nil, title: "", images: []}
+    data = imgurapi(typ, id)
+    data.each do |chunk|
+      result[:images].push({url: chunk["link"], title: chunk["title"], description: chunk["description"]})
     end
     return result
   end
 
-  # can't just do https://zippy.gfycat.com/... because gfycat may host webms on different hosts
-  def self.gfycatdl(url, response)
-    parts = URI.parse(url)
-    info = {name: nil, images: []}
-    info[:name] = parts.path.split("/")[1]
-    apiurl = Util::build_uri({scheme: "https", host: "gfycat.com", path: File.join("/cajax/get", info[:name])})
-    apiresponse = Util::download(apiurl.to_s)
-    if apiresponse then
-      json = JSON.parse(apiresponse.to_s)
-      gfyitem = json["gfyItem"]
-      info[:images] << {url: gfyitem["webmUrl"], title: gfyitem["redditIdText"], description: ""}
-      return info
-    else
-      raise ArgumentError, "gfycat api call failed!"
-    end
-  end
-
-  def self.noembed(url, response)
+  # noembed.com is for sites that technically have an api,
+  # but are run by anal-retentive cunts who'd make you
+  # pay $5000 just to retrieve a file.
+  # fuck you flickr
+  def noembed(url, response)
     jsonurl = Util::build_uri({
       scheme: "https",
       host: "noembed.com",
@@ -262,42 +358,70 @@ module Adapters
     end
   end
 
-  def self.flickrdl(url, response)
-    return self.noembed(url, response)
-  end
-
-  def self.deviantartdl(url, response)
-    return self.noembed(url, response)
-  end
-
-  # attempt to avoid redirects (in an extremely primitive way)
-  def self.fixurl(url)
-    parts = URI.parse(url.scrub)
-    if parts.host.match(/^(www\.)?gfycat.com/) then
-      parts.scheme = "https"
-      if parts.host == "www.gfycat.com" then
-        parts.host = "gfycat.com"
+  def handle_imgur(uri, *rest)
+    if @haveimgurapi then
+      pathparts = uri.path.split("/").reject(&:empty?)
+      if uri.path.start_with?("/a/") then
+        id = pathparts[1]
+        return imgurdl(:album, id)
+      elsif uri.path.start_with?("/gallery/") then
+        id = partparts[1]
+        return imgurdl(:gallery, id)
+      else
+        id = pathparts[0]
+        if (pathparts.length == 1) then
+          return imgurdl(:image, id)
+        else
+          raise NoAdapterError, "failed to figure out type of imgur page for #{uri.to_s.inspect}"
+        end
       end
-      return parts.to_s
-    elsif parts.host == "i.reddituploads.com" then
-      return CGI.unescapeHTML(url)
-    elsif (parts.host == "i.imgur.com") && parts.path.end_with?(".gifv") then
-      parts.path.gsub!(/\.gifv/, ".gif")
-      return parts.to_s
     end
-    return url
+    raise NoAdapterError, "cannot use imgur api without api key"
   end
 
-  def self.tryparse(url, response)
+  # can't just do https://zippy.gfycat.com/... because gfycat may host webms on different hosts
+  def handle_gfycat(url, response)
+    parts = URI.parse(url)
+    info = {name: nil, images: []}
+    info[:name] = parts.path.split("/")[1]
+    apiurl = Util::build_uri({scheme: "https", host: "gfycat.com", path: File.join("/cajax/get", info[:name])})
+    apiresponse = Util::download(apiurl.to_s)
+    if apiresponse then
+      json = JSON.parse(apiresponse.to_s)
+      gfyitem = json["gfyItem"]
+      info[:images].push({url: gfyitem["webmUrl"], title: gfyitem["redditIdText"], description: ""})
+      return info
+    else
+      raise ArgumentError, "gfycat api call failed!"
+    end
+  end
+
+
+  def handle_flickr(url, response)
+    return noembed(url, response)
+  end
+
+  def handle_deviantart(url, response)
+    return noembed(url, response)
+  end
+
+  # attempt to extract a known adapter.
+  # basically, if the http response responds with a mimetype that
+  # is something other than "image/*", the most likely reason is that
+  # it is hosted on a page that is also responding (duh).
+  # (in other words, if the response code is something other than 200, this will fail)
+  # in those cases, this function resumes download via an adapter, that
+  # parses/extracts the final file(s).
+  def tryparse(url, response)
     parts = URI.parse(url)
     if parts.host.match(/(www\.)?imgur.com/) then
-      return Adapters::imgurdl(url, response)
+      return handle_imgur(parts, response)
     elsif parts.host.match(/^(www\.)?gfycat.com/) then
-      return Adapters::gfycatdl(url, response)
+      return handle_gfycat(parts, response)
     elsif (parts.host == "flickr.com") || (parts.host == "www.flickr.com") || (parts.host == "flic.kr") then
-      return Adapters.flickrdl(url, response)
+      return handle_flickr(parts, response)
     elsif (parts.host.match(/.*\.deviantart.com$/)) then
-      return Adapters.deviantartdl(url, response)
+      return handle_deviantart(parts, response)
     else
       # todo: do username subdomain check for deviantart
       raise NoAdapterError, "no adapter for #{parts.host.to_s.dump}"
@@ -363,6 +487,8 @@ class ReddPics
       actual = contenttype_to_ext(response)
       realext = (((ext == nil) || (ext.size == 0)) ? actual : ext)
       # let's not mess around, if the content-type isn't some type of image, it's b0rked
+      # and also if the webmaster does some pants-on-head retarded bullshit
+      # like using backward slashes, just disregard the thing
       if (not actual) && (not is_album) then
         raise ArgumentError, "url #{url.dump} has a funky path, and did not set a 'Content-Type' header!!!"
       end
@@ -374,6 +500,8 @@ class ReddPics
     prefix = (((fileindex != nil) && (not is_album)) ? "#{fileindex}-" : "")
     # lump it all together
     threadid = info.id
+    # if the user deleted their account, it'd become "[deleted]",
+    # so get rid of the brackets
     username = info.author.name.gsub(/[\[\]]/, "")
     score = info.score
     title = Util::sanitize_filename(info.title)
@@ -423,10 +551,10 @@ class ReddPics
         if response_is_image(response) then
           dlfolder = (subfolder ? File.join(@destfolder, subfolder) : @destfolder)
           filename = get_filename(url, response: response, fileindex: fileindex, info: info)
-          FileUtils.mkdir_p(dlfolder)
+          FileUtils.mkdir_p(dlfolder) unless File.directory?(dlfolder)
           # using chdir() to avoid a possible race condition (relatively unlikely, though)
           Dir.chdir(dlfolder) do
-            if not File.file?(filename) then
+            if not Util.file_exists?(filename) then
               size = response.content_length || 0
               sizestr = Filesize.new(size).to_f("MB")
               if size >= @maxfilesize then
@@ -434,10 +562,14 @@ class ReddPics
               else
                 Logger.putline("writing image to file #{filename.dump} (#{sizestr} MB, #{size} bytes) ...", color: :green)
                 File.open(filename, "w") do |fh|
+                  # a neat feature of http.rb is that it only retrieves
+                  # the header at first -- which makes HTTP queries very lightweight.
+                  # the actual body is downloaded later (http.rb calls it streaming),
+                  # and here's a prime example of how useful this actually is!
                   while true do
                     data = response.readpartial
                     break if (data == nil)
-                    fh << data
+                    fh.write(data)
                   end
                 end
                 @dlcount += 1
@@ -449,8 +581,7 @@ class ReddPics
           end
         else
           begin
-            links = Adapters::tryparse(url, response)
-            name = links[:links]
+            links = @adapters.tryparse(url, response)
             if links[:images].size == 0 then
               Logger.putline("didn't find any images!", color: :yellow)
             elsif links[:images].size == 1 then
@@ -499,7 +630,7 @@ class ReddPics
     rescue Redd::Forbidden => err
       Logger.putline("cannot access /r/#{@subreddit}: #{err}", color: :red)
       return nil
-    rescue Redd::ServerError => err
+    rescue Redd::ServerError, HTTP::ConnectionError, HTTP::TimeoutError => err
       Logger.putline("#{err.class}: something went really wrong", color: :red)
       return nil
     rescue Redd::TokenRetrievalError => err
@@ -532,7 +663,7 @@ class ReddPics
         links.each do |chunk|
           begin
             id = chunk.id
-            url = Adapters::fixurl(chunk.url.scrub.force_encoding("ascii"))
+            url = Util::fixurl(chunk.url.scrub.force_encoding("ascii"))
             title = chunk.title
             permalink = chunk.permalink
             isself = chunk.is_self
@@ -579,10 +710,10 @@ class ReddPics
 
   def login
     @client = Redd.it(
-      client_id: @authinfo[:appid],
-      secret: @authinfo[:apikey],
-      username: @authinfo[:username],
-      password: @authinfo[:password],
+      client_id: @authinfo[:redditappid],
+      secret: @authinfo[:redditapikey],
+      username: @authinfo[:redditusername],
+      password: @authinfo[:redditpassword],
       user_agent: "ImageDownloader (ver1.0)"
     )
     @loginattempts += 1
@@ -603,7 +734,8 @@ class ReddPics
     @cachefile = File.join(@destfolder, ".cache_#{@subreddit}.json")
     @cachedlinks = {}
     @cachemode = "w"
-    FileUtils.mkdir_p(@destfolder)
+    @adapters = Adapters.new(authinfo, opts)
+    FileUtils.mkdir_p(@destfolder) unless File.directory?(@destfolder)
     if @opts[:logfile] then
       @logfile = sprintf(@opts[:logfile], @subreddit)
       @loghandle = File.open(@logfile, "wb")
@@ -677,13 +809,13 @@ begin
         "  %{score}    - votes score\n" +
         "  %{created}  - UNIX timestamp at which time the link was submitted\n",
       type: String, default: "%{title}-%{id}")
-    opt(:username,  "Your reddit username - overrides 'REDDPICS_USERNAME'",
+    opt(:redditusername,  "Your reddit username - overrides 'REDDPICS_USERNAME'",
       type: String)
-    opt(:password,  "Your reddit password - overrides 'REDDPICS_PASSWORD'",
+    opt(:redditpassword,  "Your reddit password - overrides 'REDDPICS_PASSWORD'",
       type: String)
-    opt(:apikey,    "Your API key - overrides 'REDDPICS_APIKEY'",
+    opt(:redditapikey,    "Your API key - overrides 'REDDPICS_APIKEY'",
       type: String)
-    opt(:appid,     "Your API appid - overrides 'REDDPICS_APPID'",
+    opt(:redditappid,     "Your API appid - overrides 'REDDPICS_APPID'",
       type: String)
     opt(:apihelp,   "Prints a quick'n'dirty explanation how to get your API credentials", short: "-#")
   end
@@ -691,19 +823,24 @@ begin
   if opts[:apihelp] then
     puts APIHELPSTRING
   elsif ARGV.size > 0 then
-    authinfo =
-    {
-      appid:    opts[:appid]    || ENV["REDDPICS_APPID"],
-      apikey:   opts[:apikey]   || ENV["REDDPICS_APIKEY"],
-      username: opts[:username] || ENV["REDDPICS_USERNAME"],
-      password: opts[:password] || ENV["REDDPICS_PASSWORD"],
-    }
-    Trollop::die(:limit,    "must be less than 100") if opts[:limit] > 100
-    Trollop::die(:maxpages, "value must be larger than zero") if opts[:maxpages] == 0
-    Trollop::die(:apikey,   "must be set (try '--apihelp')") if not authinfo[:apikey]
-    Trollop::die(:time,     "uses an invalid timespan") if not opts[:time].match(/^(day|week|month|year|all)$/)
-    Trollop::die(:filesize, "must have a proper size suffix") if not opts[:filesize].match(/^\d+[kmgtpezy]b$/i)
-    ARGV.each do |subreddit|
+    actualargv = []
+    ARGV.each do |arg|
+      if File.file?(arg) then
+        $stderr.printf("ERROR:\n")
+        $stderr.printf("subreddit argument %p also exists as a file in the current working directory\n", arg)
+        $stderr.printf("please delete it, or change into a different directory!\n")
+      else
+        actualargv.push(arg)
+      end
+    end
+    authinfo = Util::get_local_config_with_opts(opts)
+    p [:authinfo, authinfo]
+    Trollop::die(:limit,        "must be less than 100") if opts[:limit] > 100
+    Trollop::die(:maxpages,     "value must be larger than zero") if opts[:maxpages] == 0
+    Trollop::die(:redditapikey, "must be set (try '--apihelp')") if not authinfo[:redditapikey]
+    Trollop::die(:time,         "uses an invalid timespan") if not opts[:time].match(/^(day|week|month|year|all)$/)
+    Trollop::die(:filesize,     "must have a proper size suffix") if not opts[:filesize].match(/^\d+[kmgtpezy]b$/i)
+    actualargv.each do |subreddit|
       instanceopts = opts.dup
       if opts[:outputdir] then
         if opts[:outputdir].match(/%s/) then
@@ -717,8 +854,8 @@ begin
       ReddPics.new(authinfo, subreddit, instanceopts)
     end
   else
-    puts "usage: #{File.basename $0} <subreddit> [ -o <destination-folder> [... <other options>]]"
-    puts "try #{File.basename $0} --help for other options"
+    puts("usage: #{File.basename $0} <subreddit> [ -o <destination-folder> [... <other options>]]")
+    puts("try #{File.basename $0} --help for other options")
   end
 end
 
