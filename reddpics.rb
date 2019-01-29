@@ -5,11 +5,11 @@ require "uri"
 require "uri/http"
 require "cgi"
 require "pp"
+require "optparse"
 require "yaml"
 require "redd"
 require "http"
 require "nokogiri"
-require "trollop"
 require "colorize"
 require "filesize"
 
@@ -54,6 +54,19 @@ like REDDPICS_APIKEY, etc, in the usual fashion.
 And that's it! Sounds complicated, but it really isn't. Really!
 }.strip
 
+DEFAULT_CONFIG_VALUES = {
+  logfile: "log_%s.txt",
+  maxpages: 20,
+  filesize: "10MB",
+  limit: 100,
+  section: "top",
+  time: "all",
+  template: "%{title}-%{id}",
+  converttowebp: false,
+  tm_connect: 5,
+  tm_read: 5,
+  tm_write: 5,
+}
 
 # exceptions
 class NoAdapterError < StandardError
@@ -107,14 +120,14 @@ class Logger
 end
 
 module Util
-  def self.download(url, headers: {}, maxredirs: 5)
+  def self.download(url, headers: {}, maxredirs: 5, tm_connect: 5, tm_read: 5, tm_write: 5)
     now = Time.now
     tstamp =  sprintf("%02d:%02d:%02d", now.hour, now.min, now.sec)
     # maybe add {"accept-encoding" => "identity"}?
     Logger.put("[#{tstamp}] wget(#{url.dump}) ... ")
     begin
       #headers["accept-encoding"] = "identity"
-      response = HTTP.timeout(:global, :write => 2, :connect => 2, :read => 2).headers(headers).follow(true).get(url)
+      response = HTTP.timeout(:global, connect: tm_connect, read: tm_read, write: tm_write).headers(headers).follow(true).get(url)
       if response.code >= 400 then
         Logger.write("failed: HTTP status #{response.code} #{response.reason}\n", color: :red)
         return nil
@@ -123,7 +136,8 @@ module Util
         # url (i.e., http://i.imgur.com/whatever.jpg) does a 302 to
         # /removed.png, which, itself, is served as 200 OK.
         # hence this hack.
-        if response.uri.path.match("/removed.png") then
+        # todo: this really shouldn't need to be necessary, but imgur is run by retards, so...
+        if response.uri.host.match(/imgur\.com$/) && response.uri.path.match("/removed.png") then
           Logger.write("failed: image has been removed (imgur hackery)\n", color: :red)
           return nil
         end
@@ -169,17 +183,17 @@ module Util
     # get rid of any junk space
     filename.strip!
     # get rid of dots
-    filename.gsub!(/\./, '')
+    filename.gsub!(/\./, '') while filename.match(/\./)
     # get only the filename, not the whole path
     filename.gsub!(/^.*(\\|\/)/, '')
     # replace non-ascii characters
     filename.gsub!(/[^0-9A-Za-z.\-]/, '_')
     # get rid of double underscores
-    filename.gsub!(/__/, '_')
+    filename.gsub!(/__/, '_') while filename.match(/__/)
     # get rid of underscore at beginning of string
-    filename.gsub!(/^_/, '')
+    filename.gsub!(/^_/, '') while filename.match(/^_/)
     # get rid of underscore at end of string
-    filename.gsub!(/_$/, '')
+    filename.gsub!(/_$/, '') while filename.match(/_$/)
     # finally, strip down to $max_length
     return filename[0 .. max_length]
   end
@@ -197,9 +211,7 @@ module Util
             failed = true
           end
         end
-        #if not failed then
-          return rt
-        #end
+        return rt
       rescue => ex
         Logger.putline("configfile: YAML.load_file failed: (#{ex.class}) #{ex.message}")
       end
@@ -209,40 +221,23 @@ module Util
     return {}
   end
 
-  def self.get_local_config_with_opts(opts)
-    confrt = read_local_configfile
-    # no config file, or parsing failed, so try env instead.
-    # this is for backwards compatibility ONLY!
-    # will be removed in the future, because setting env is
-    # a crazy huge security hole.
-    if confrt.nil? then
-      failed = false
-      authinfo = {}
-      tmpinfo =
-      {
-        redditappid:    [opts[:redditappid], ENV["REDDPICS_APPID"]],
-        redditapikey:   [opts[:redditapikey], ENV["REDDPICS_APIKEY"]],
-        redditusername: [opts[:redditusername], ENV["REDDPICS_USERNAME"]],
-        redditpassword: [opts[:redditpassword], ENV["REDDPICS_PASSWORD"]],
-      }
-      Logger.putline("localconfig: trying commandline options, and environment variables")
-      tmpinfo.each do |k, v|
-        optval, envval = v
-        if optval.nil? && envval.nil? then
-          failed = true
-          Logger.putline("localconfig: key #{k.to_s.dump} has neither an option value, nor an environment value!", color: :red)
-        else
-          authinfo[k.to_sym] = (optval || envval)
+  def self.get_local_config(defaults)
+    newopts = defaults.dup
+    rt = read_local_configfile
+    rt.each do |k, v|
+      if defaults.include?(k) then
+        v = case defaults[k].class
+          when String then
+            v.to_s
+          when Numeric then
+            v.to_i
+          else
+            v
         end
       end
-      if not failed then
-        return authinfo
-      end
-    else
-      return confrt
+      newopts[k] = v
     end
-    Logger.putline("localconfig: No login information available! Try 'reddpics --help'.", color: :red)
-    return nil
+    return newopts
   end
 
   # attempt to avoid redirects (in an extremely primitive way)
@@ -275,14 +270,20 @@ module Util
     end
     return url
   end
+
+  def self.replace_extension(filename, newext, icase=true)
+    fext = File.extname(filename)
+    rx = Regexp.new(Regexp.quote(fext) + "$", icase ? Regexp::IGNORECASE : 0)
+    return filename.gsub(rx, newext)
+  end
 end
 
 class Adapters
-  def initialize(authinfo, opts)
-    @authinfo = authinfo
+  def initialize(opts, dlopts)
     @opts = opts
+    @dloptions = dlopts
     @haveimgurapi = false
-    if @authinfo[:imgurappid] then
+    if @opts[:imgurappid] then
       @haveimgurapi = true
     else
       Logger.putline("no app-id registered for imgur! scraping will not be available.")
@@ -308,10 +309,10 @@ class Adapters
   end
 
   def imgurapi(typ, id)
-    appid = @authinfo[:imgurappid]
+    appid = @opts[:imgurappid]
     uri = imgurmakeuri(typ, id)
     clheader = sprintf("Client-ID %s", appid)
-    res = Util::download(uri, headers: {"Authorization" => clheader})
+    res = Util.download(uri, headers: {"Authorization" => clheader}, **@dloptions)
     rawjson = res.body.to_s
     parsedjson = JSON.parse(rawjson)
     if parsedjson["success"] == true then
@@ -339,13 +340,13 @@ class Adapters
   # pay $5000 just to retrieve a file.
   # fuck you flickr
   def noembed(url, response)
-    jsonurl = Util::build_uri({
+    jsonurl = Util.build_uri({
       scheme: "https",
       host: "noembed.com",
       path: "/embed",
       query: "url=#{url}"
     })
-    jsonresponse = Util::download(jsonurl.to_s)
+    jsonresponse = Util.download(jsonurl.to_s, **@dloptions)
     if jsonresponse then
       jsondata = JSON.parse(jsonresponse.to_s)
       if (mediaurl = jsondata["media_url"]) != nil then
@@ -365,7 +366,7 @@ class Adapters
         id = pathparts[1]
         return imgurdl(:album, id)
       elsif uri.path.start_with?("/gallery/") then
-        id = partparts[1]
+        id = pathparts[1]
         return imgurdl(:gallery, id)
       else
         id = pathparts[0]
@@ -380,12 +381,20 @@ class Adapters
   end
 
   # can't just do https://zippy.gfycat.com/... because gfycat may host webms on different hosts
-  def handle_gfycat(url, response)
-    parts = URI.parse(url)
+  def handle_gfycat(uri, response)
+    #### unused code ####
     info = {name: nil, images: []}
-    info[:name] = parts.path.split("/")[1]
-    apiurl = Util::build_uri({scheme: "https", host: "gfycat.com", path: File.join("/cajax/get", info[:name])})
-    apiresponse = Util::download(apiurl.to_s)
+    upath = uri.path.split("/").map(&:strip).reject(&:empty?)
+    if (upath[0] =~ /^gifs?$/) && (upath[1] =~ /^details?$/) then
+      # uri is something like 'https://gfycat.com/gifs/detail/<id>'
+      # so get last item
+      info[:name] = upath[-1]
+    else
+      info[:name] = upath[0]
+    end
+    # https://api.gfycat.com/v1/gfycats/<id>
+    apiurl = Util.build_uri({scheme: "https", host: "api.gfycat.com", path: File.join("/v1/gfycats", info[:name])})
+    apiresponse = Util.download(apiurl.to_s, **@dloptions)
     if apiresponse then
       json = JSON.parse(apiresponse.to_s)
       gfyitem = json["gfyItem"]
@@ -393,6 +402,7 @@ class Adapters
       return info
     else
       raise ArgumentError, "gfycat api call failed!"
+      #return noembed(uri, nil)
     end
   end
 
@@ -432,7 +442,8 @@ end
 class ReddPics
   # this variable is modified with each call of ReddPics
   # to keep track of total downloaded files
-  @@total_downloaded = 0
+  @@total_downloaded_filecount = 0
+  @@total_downloaded_filebytes = 0
 
   # primitive content_type check for mime types we can actually
   # use
@@ -504,7 +515,7 @@ class ReddPics
     # so get rid of the brackets
     username = info.author.name.gsub(/[\[\]]/, "")
     score = info.score
-    title = Util::sanitize_filename(info.title)
+    title = Util.sanitize_filename(info.title)
     #if the title is empty, substitute with basename
     if title.empty? then
       title = basename
@@ -545,7 +556,7 @@ class ReddPics
     if not fileindex then
       Logger.putline("thread: #{info.title.dump} (https://redd.it/#{info.id})", color: :blue)
     end
-    response = Util::download(url, headers: {referer: "https://www.reddit.com/r/#{@subreddit}"})
+    response = Util.download(url, headers: {referer: "https://www.reddit.com/r/#{@subreddit}"}, **@dloptions)
     if response then
       begin
         if response_is_image(response) then
@@ -568,12 +579,16 @@ class ReddPics
                   # and here's a prime example of how useful this actually is!
                   while true do
                     data = response.readpartial
-                    break if (data == nil)
+                    if (data == nil) then
+                      break
+                    end
+                    @@total_downloaded_filebytes += data.bytesize
                     fh.write(data)
                   end
                 end
                 @dlcount += 1
                 @cachedlinks[info.id] = info
+                post_download(filename)
               end
             else
               Logger.putline("already downloaded", color: :yellow)
@@ -627,7 +642,7 @@ class ReddPics
         else
           raise ArgumentError, "section #{section.dump} is unknown, or not yet handled"
       end
-    rescue Redd::Forbidden => err
+    rescue Redd::Forbidden, Redd::NotFound => err
       Logger.putline("cannot access /r/#{@subreddit}: #{err}", color: :red)
       return nil
     rescue Redd::ServerError, HTTP::ConnectionError, HTTP::TimeoutError => err
@@ -663,7 +678,7 @@ class ReddPics
         links.each do |chunk|
           begin
             id = chunk.id
-            url = Util::fixurl(chunk.url.scrub.force_encoding("ascii"))
+            url = Util.fixurl(chunk.url.scrub.force_encoding("ascii"))
             title = chunk.title
             permalink = chunk.permalink
             isself = chunk.is_self
@@ -694,13 +709,28 @@ class ReddPics
   end
 
   def writecache
+    cacheme = {}
+    @cachedlinks.each do |id, info|
+      if info.is_a?(String) then
+        #cacheme[id] = info
+      else
+        title = (info.is_a?(Hash) ? info["title"] : info.title)
+        url   = (info.is_a?(Hash) ? info["url"] : info.url)
+        thrurl = sprintf("https://reddit.com/r/%s/comments/%s/", @subreddit, id)
+        cacheme[id] = {title: title, url: url, thread: thrurl}
+      end
+    end
     begin
       $stderr.puts("writing cache (please be patient!) ...")
       File.open(@cachefile, @cachemode) do |fh|
         #fh << JSON.pretty_generate(@cachedlinks)
         #fh << JSON.dump(@cachedlinks)
-        JSON.dump(@cachedlinks, fh)
+        #JSON.dump(@cachedlinks, fh)
+        fh.puts(JSON.pretty_generate(cacheme))
       end
+    rescue Interrupt => err
+      Logger.putline("caching was interrupted! trying again ...")
+      writecache
     rescue => err
       Logger.putline("failed to write cache to #{@cachefile}: (#{err.class}) #{err}")
     else
@@ -710,19 +740,48 @@ class ReddPics
 
   def login
     @client = Redd.it(
-      client_id: @authinfo[:redditappid],
-      secret: @authinfo[:redditapikey],
-      username: @authinfo[:redditusername],
-      password: @authinfo[:redditpassword],
+      client_id: @opts[:redditappid],
+      secret: @opts[:redditapikey],
+      username: @opts[:redditusername],
+      password: @opts[:redditpassword],
       user_agent: "ImageDownloader (ver1.0)"
     )
     @loginattempts += 1
   end
 
-  def initialize(authinfo, subreddit, opts)
-    @authinfo = authinfo
+  def post_download(filename)
+    begin
+      if @wantwebp then
+        postdl_convert_webp(filename)
+      end
+    rescue => ex
+      Logger.putline(sprintf("post_download: error: (%s) %s", ex.class.name, ex.message), color: :red)
+    end
+  end
+
+  def postdl_convert_webp(infile)
+    fext = File.extname(infile)
+    if fext.match(/\.(jpe?g|png)$/i) then
+      fdest = Util.replace_extension(infile, ".webp")
+      Logger.putline("webp: converting to #{fdest.dump} ...")
+      Thread.new{
+        if system("gm", "convert", infile, fdest) then
+          Logger.putline("webp: deleting original #{infile.dump} ...")
+          FileUtils.rm_f(infile)
+        else
+          Logger.putline("webp: command 'gm convert' failed (maybe you need to install graphicsmagick first?)")
+          FileUtils.rm_f(fdest) if File.file?(fdest)
+        end
+      }.join
+    else
+      Logger.putline("webp: #{infile.dump} cannot be converted: only JPEG and PNG supported")
+    end
+  end
+
+  def initialize(subreddit, opts)
     @subreddit = subreddit
     @opts = opts
+    @wantwebp = @opts[:converttowebp]
     @destfolder = @opts[:outputdir]
     @section = @opts[:section]
     @pagecounter = @opts[:maxpages] - 1
@@ -734,7 +793,13 @@ class ReddPics
     @cachefile = File.join(@destfolder, ".cache_#{@subreddit}.json")
     @cachedlinks = {}
     @cachemode = "w"
-    @adapters = Adapters.new(authinfo, opts)
+    @dloptions = {
+      tm_connect: @opts[:tm_connect],
+      tm_read: @opts[:tm_read],
+      tm_write: @opts[:tm_write],
+    }
+    $stderr.printf("dloptions=%p\n", @dloptions)
+    @adapters = Adapters.new(@opts, @dloptions)
     FileUtils.mkdir_p(@destfolder) unless File.directory?(@destfolder)
     if @opts[:logfile] then
       @logfile = sprintf(@opts[:logfile], @subreddit)
@@ -767,64 +832,134 @@ class ReddPics
         @loghandle.puts("### logging finished: #{Time.now}\n")
         @loghandle.close
       end
-      @@total_downloaded += @dlcount
+      @@total_downloaded_filecount += @dlcount
       Logger.putline("=== statistics for /r/#{@subreddit}:")
       Logger.putline("=== downloaded #{@dlcount} images")
-      Logger.putline("=== and #{@@total_downloaded} in total")
+      Logger.putline("=== total retrieved files: #{@@total_downloaded_filecount}")
+      Logger.putline("=== total retrieved data: #{Filesize.new(@@total_downloaded_filebytes).pretty}")
       writecache
     end
   end
 end
 
+def failopt_if(opt, msg, boolexpr)
+  if boolexpr then
+    $stderr.printf("error parsing option '--%s': %s\n", opt, msg)
+    exit(1)
+  end
+end
+
+def kvopt_deparse(str)
+  if str.include?(":") then
+    key, *rest = str.split(":")
+    key.strip!
+    val = rest.join(":")
+    if (key.empty? || val.empty?) || (not key.match(/[a-z0-9_]/i)) then
+      return nil
+    end
+    return [key.to_sym, val]
+  end
+  return nil
+end
+
+def kvopt_makevalue(key, rawval, opts)
+  if opts.key?(key) then
+    if opts[key].is_a?(Numeric) then
+      return rawval.to_i
+    end
+  end
+  return rawval
+end
+
 begin
-  opts = Trollop::options do
-    banner (
-      "Usage: #{File.basename $0} <subreddit ...> [<options>]\n" +
-      "Valid options:"
-    )
-    opt(:logfile,    "if set, log will also be written to this file. as with '-o', you can use %s as template",
-      type: String, short: "-d", default: "log_%s.txt")
-    opt(:outputdir,
-        "Output directory to download images to. default is './r_<subredditname>'.\n" + 
-        "You can use '%s' as template (for example, when downloading from several subreddits)",
-      type: String)
-    opt(:maxpages,  "Maximum pages to fetch (note: values over 10 may not work!)",
-      type: Integer, default: 10)
-    opt(:filesize,  "Maximum filesize for images",
-      type: String, default: "10MB")
-    opt(:limit,     "How many links to fetch per page. Maximum value is 100",
-      type: Integer, default: 100)
-    opt(:section,   "What to download. options are 'new', 'hot', 'top', and 'controversial'.",
-      type: String, default: "top")
-    opt(:time,      "From which timespan to download. options are 'day', 'week', 'month', 'year', and 'all'.",
-      type: String, default: "all")
-    opt(:template, \
+  opts = Util.get_local_config(DEFAULT_CONFIG_VALUES)
+  prs = OptionParser.new{|prs|
+    prs.on("-d<val>", "--logfile=<val>", "write log to <val> instead of 'log_<subreddit>.log' (can be templated with '%s')"){|v|
+      opts[:logfile] = v
+    }
+    prs.on("--outputdir=<val>", "set output directory.. default is './r_<subredditname>' (can be templated with '%s')"){|v|
+      opts[:outputdir] = v
+    }
+    prs.on("--maxpages=<val>", "Maximum pages to fetch (note: values over 10 may not work!)"){|v|
+      opts[:maxpages] = v.to_i
+    }
+    prs.on("--filesize=<val>", "Maximum filesize for images"){|v|
+      opts[:filesize] = v.to_i
+    }
+    prs.on("--limit=<val>", "How many links to fetch per page. Maximum value is 100"){|v|
+      opts[:limit] = v.to_i
+    }
+    prs.on("--section=<val>", "What to download. options are 'new', 'hot', 'top', and 'controversial'."){|v|
+      opts[:section] = v
+    }
+    prs.on("--time=<val>", "From which timespan to download. options are 'day', 'week', 'month', 'year', and 'all'."){|v|
+      opts[:time] = v
+    }
+    prs.on("--template=<val>", "file naming template string. use '--templatehelp' for more info"){|v|
+      opts[:template] = v
+    }
+    prs.on("--redditusername=<val>", "Your reddit username - overrides 'REDDPICS_USERNAME'"){|v|
+      opts[:redditusername] = v
+    }
+    prs.on("--redditpassword=<val>", "Your reddit password - overrides 'REDDPICS_PASSWORD'"){|v|
+      opts[:redditpassword] = v
+    }
+    prs.on("--redditapikey=<val>", "Your API key - overrides 'REDDPICS_APIKEY'"){|v|
+      opts[:redditapikey] = v
+    }
+    prs.on("--redditappid=<val>", "Your API appid - overrides 'REDDPICS_APPID'"){|v|
+      opts[:redditappid] = v
+    }
+    prs.on("--timeout=<n>", "timeout after <n> seconds (sets 'tm_connect', 'tm_read', 'tm_write')"){|v|
+      tv = v.to_i
+      [:tm_connect, :tm_read, :tm_write].each do |name|
+        opts[name] = tv
+      end
+    }
+    prs.on("-w", "--[no-]converttowebp", "convert downloaded file to .webp (to reduce size significantly)"){|v|
+      opts[:converttowebp] = v
+    }
+    prs.on("-x<key>:<value>", "--set=<key>:<value>", "set a raw named option. use '--dumpopts' to see available options"){|s|
+      if (dt = kvopt_deparse(s)) != nil then
+        k, v = dt
+        opts[k] = kvopt_makevalue(k, v, opts)
+      else
+        $stderr.printf("error: failed to parse %p. expected format: <key> \":\" <value> (i.e., \"-xfilesize:10MB\")\n")
+      end
+    }
+    prs.on("--dumpopts", "dumps available options for '-x'"){|_|
+      $stderr.printf("options:\n")
+      opts.each do |k, v|
+        $stderr.printf("%15s: %p\n", k.to_s, v)
+      end
+      exit(0)
+    }
+    prs.on("-#", "--apihelp", "Prints a quick'n'dirty explanation how to get your API credentials"){|v|
+      puts(APIHELPSTRING)
+      exit(0)
+    }
+    prs.on("--templatehelp", "show information regarding templates"){|_|
+      puts(
         "Filename template to use when downloading files. extension is automatically added.\n" +
         "album indexes are added regardless of the template chosen.\n" +
-        "valid variables:\n"+
+        "valid variables:\n" +
         "  %{name}     - the extracted filename, minus file extension\n" +
         "  %{title}    - the cleaned up title of the thread\n" +
         "  %{id}       - reddit thread id (i.e., http://reddit.com/r/subreddit/comments/<id>/...)\n" +
         "  %{username} - reddit username ('deleted' when user deleted their account)\n" +
         "  %{score}    - votes score\n" +
-        "  %{created}  - UNIX timestamp at which time the link was submitted\n",
-      type: String, default: "%{title}-%{id}")
-    opt(:redditusername,  "Your reddit username - overrides 'REDDPICS_USERNAME'",
-      type: String)
-    opt(:redditpassword,  "Your reddit password - overrides 'REDDPICS_PASSWORD'",
-      type: String)
-    opt(:redditapikey,    "Your API key - overrides 'REDDPICS_APIKEY'",
-      type: String)
-    opt(:redditappid,     "Your API appid - overrides 'REDDPICS_APPID'",
-      type: String)
-    opt(:apihelp,   "Prints a quick'n'dirty explanation how to get your API credentials", short: "-#")
-  end
-
-  if opts[:apihelp] then
-    puts APIHELPSTRING
-  elsif ARGV.size > 0 then
+        "  %{created}  - UNIX timestamp at which time the link was submitted\n" +
+        ""
+      )
+      exit(0)
+    }
+  }
+  prs.parse!
+  if ARGV.size > 0 then
     actualargv = []
-    ARGV.each do |arg|
+    ARGV.each do |farg|
+      arg = farg.dup
+      arg.gsub!(/\//, "") while arg.match(/\//)
       if File.file?(arg) then
         $stderr.printf("ERROR:\n")
         $stderr.printf("subreddit argument %p also exists as a file in the current working directory\n", arg)
@@ -833,13 +968,11 @@ begin
         actualargv.push(arg)
       end
     end
-    authinfo = Util::get_local_config_with_opts(opts)
-    p [:authinfo, authinfo]
-    Trollop::die(:limit,        "must be less than 100") if opts[:limit] > 100
-    Trollop::die(:maxpages,     "value must be larger than zero") if opts[:maxpages] == 0
-    Trollop::die(:redditapikey, "must be set (try '--apihelp')") if not authinfo[:redditapikey]
-    Trollop::die(:time,         "uses an invalid timespan") if not opts[:time].match(/^(day|week|month|year|all)$/)
-    Trollop::die(:filesize,     "must have a proper size suffix") if not opts[:filesize].match(/^\d+[kmgtpezy]b$/i)
+    failopt_if(:limit,        "must be less than 100", opts[:limit] > 100)
+    failopt_if(:maxpages,     "value must be larger than zero", opts[:maxpages] == 0)
+    failopt_if(:redditapikey, "must be set (try '--apihelp')", (not opts[:redditapikey]))
+    failopt_if(:time,         "uses an invalid timespan", (not opts[:time].match(/^(day|week|month|year|all)$/)))
+    failopt_if(:filesize,     "must have a proper size suffix", (not opts[:filesize].match(/^\d+[kmgtpezy]b$/i)))
     actualargv.each do |subreddit|
       instanceopts = opts.dup
       if opts[:outputdir] then
@@ -851,7 +984,7 @@ begin
         instanceopts[:outputdir] = subreddit
       end
       String.disable_colorization(true) if not $stderr.tty?
-      ReddPics.new(authinfo, subreddit, instanceopts)
+      ReddPics.new(subreddit, instanceopts)
     end
   else
     puts("usage: #{File.basename $0} <subreddit> [ -o <destination-folder> [... <other options>]]")
