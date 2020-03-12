@@ -9,9 +9,13 @@ require "optparse"
 require "yaml"
 require "redd"
 require "http"
-require "nokogiri"
 require "colorize"
 require "filesize"
+require "pry-byebug"
+begin
+  require "nokogiri"
+rescue LoadError
+end
 
 APIHELPSTRING = %q{
 First, login to your account.
@@ -56,16 +60,16 @@ And that's it! Sounds complicated, but it really isn't. Really!
 
 DEFAULT_CONFIG_VALUES = {
   logfile: "log_%s.txt",
-  maxpages: 20,
-  filesize: "10MB",
+  maxpages: 40,
+  filesize: "50MB",
   limit: 100,
   section: "top",
   time: "all",
   template: "%{title}-%{id}",
   converttowebp: false,
-  tm_connect: 5,
-  tm_read: 5,
-  tm_write: 5,
+  tm_connect: 50,
+  tm_read: 500,
+  tm_write: 500,
 }
 
 # exceptions
@@ -286,7 +290,7 @@ class Adapters
     if @opts[:imgurappid] then
       @haveimgurapi = true
     else
-      Logger.putline("no app-id registered for imgur! scraping will not be available.")
+      Logger.putline("no app-id registered for imgur! album scraping will not be available.")
     end
   end
 
@@ -466,18 +470,22 @@ class ReddPics
           return "bmp"
         when "gif" then
           return "gif"
-        when /jpe?g/ then
+        # reddituploads.com returns "image/*" .... i'm not kidding!
+        # seems they're actually jpgs. why do i need to keep
+        # working around stuff like this? just fix your shit please
+        when /jpe?g/, "*" then
           return "jpg"
         when "png" then
           return "png"
         else
-          if contenttype.match("^video/webm") then
+          if contenttype.match?("^video/webm") then
             return "webm"
           else
             raise ArgumentError, "unknown image content type #{contenttype.dump} (imgtype = #{imgtype.inspect})!"
           end
       end
     end
+    return nil
   end
 
   # extract a safe-ish, reusable filename
@@ -587,7 +595,7 @@ class ReddPics
                   end
                 end
                 @dlcount += 1
-                @cachedlinks[info.id] = info
+                @cachedlinks["links"][info.id] = info
                 post_download(filename)
               end
             else
@@ -611,6 +619,9 @@ class ReddPics
               end
               Logger.indent -= 1
             end
+          rescue NoAdapterError => noa
+            Logger.putline("(#{noa.class}) #{noa.message}", color: :red)
+            @cachedlinks["other"][info.id] = info
           rescue => err
             Logger.putline("couldn't process page: (#{err.class}) #{err.message}", color: :red)
             pp err.backtrace
@@ -642,7 +653,7 @@ class ReddPics
         else
           raise ArgumentError, "section #{section.dump} is unknown, or not yet handled"
       end
-    rescue Redd::Forbidden, Redd::NotFound => err
+    rescue Redd::Forbidden, Redd::NotFound, Redd::InvalidAccess, JSON::ParserError => err
       Logger.putline("cannot access /r/#{@subreddit}: #{err}", color: :red)
       return nil
     rescue Redd::ServerError, HTTP::ConnectionError, HTTP::TimeoutError => err
@@ -668,22 +679,39 @@ class ReddPics
     end
   end
 
+  # todo: break up code repetition in Logger.putline("/r/#{@subreddit}") ...
+  #  something like sr_logline?
   def walk_subreddit(after=nil)
     links = get_listing(after)
-    if (links.nil?) || (links.empty?) then
+    if (links == nil) || (links.empty?) then
       Logger.putline("get_listing didn't return anything", color: :red)
     else
       begin
         $stderr.puts "++ received #{links.to_a.size} links ..."
         links.each do |chunk|
+          #binding.pry
           begin
             id = chunk.id
-            url = Util.fixurl(chunk.url.scrub.force_encoding("ascii"))
+            if (chunk.url == nil) then
+              # that shouldn't happen, technically
+              Logger.putline("/r/#{@subreddit}: thread #{id} has no url ... ?")
+              next
+            elsif chunk.url.start_with?("/r/") then
+              Logger.putline("/r/#{@subreddit}: thread #{id} is an x-post ...")
+              next
+            end
+            begin
+              url = Util.fixurl(chunk.url.scrub.force_encoding("ascii"))
+            rescue => ex
+              $stderr.printf("redd/reddit/reddpics keeps fucking up; starting debugger\n")
+              $stderr.printf("exception: (%s) %s\n", ex.class.name, ex.message)
+              binding.pry
+            end
             title = chunk.title
             permalink = chunk.permalink
             isself = chunk.is_self
             if not isself then
-              if @cachedlinks.has_key?(id) then
+              if @cachedlinks["links"].has_key?(id) then
                 Logger.putline("/r/#{@subreddit}: already seen thread #{id} (title: #{title.dump}, url: #{url.dump})", color: :green)
               else
                 handle_url(url, info: chunk)
@@ -709,8 +737,10 @@ class ReddPics
   end
 
   def writecache
-    cacheme = {}
-    @cachedlinks.each do |id, info|
+    cacheme = {
+      other: @cachedlinks["other"]
+    }
+    @cachedlinks["links"].each do |id, info|
       if info.is_a?(String) then
         #cacheme[id] = info
       else
@@ -791,7 +821,10 @@ class ReddPics
     @loginattempts = 0
     # todo: improve caching methods
     @cachefile = File.join(@destfolder, ".cache_#{@subreddit}.json")
-    @cachedlinks = {}
+    @cachedlinks = {
+      "links" => {},
+      "other" => {},
+    }
     @cachemode = "w"
     @dloptions = {
       tm_connect: @opts[:tm_connect],
@@ -820,6 +853,9 @@ class ReddPics
         # now load the file
         begin
           @cachedlinks = JSON.load(File.read(@cachefile))
+          if not @cachedlinks.key?("other") then
+            @cachedlinks["other"] = {}
+          end
         rescue JSON::JSONError => err
           Logger.putline("could not load cache from #{@cachefile}: (#{err.class}) #{err.message}", color: :red)
         end
@@ -837,7 +873,17 @@ class ReddPics
       Logger.putline("=== downloaded #{@dlcount} images")
       Logger.putline("=== total retrieved files: #{@@total_downloaded_filecount}")
       Logger.putline("=== total retrieved data: #{Filesize.new(@@total_downloaded_filebytes).pretty}")
-      writecache
+      if @dlcount == 0 then
+        Logger.putline("=== nothing was retrieved, leftovers will be deleted")
+        FileUtils.rm_f(@logfile)
+        begin
+          FileUtils.rmdir(@destfolder)
+        rescue => ex
+          Logger.putline("=== could not delete folder #{@destfolder.dump}: (#{ex.class}) #{ex.message}")
+        end
+      else
+        writecache
+      end
     end
   end
 end
@@ -884,7 +930,7 @@ begin
       opts[:maxpages] = v.to_i
     }
     prs.on("--filesize=<val>", "Maximum filesize for images"){|v|
-      opts[:filesize] = v.to_i
+      opts[:filesize] = v
     }
     prs.on("--limit=<val>", "How many links to fetch per page. Maximum value is 100"){|v|
       opts[:limit] = v.to_i
